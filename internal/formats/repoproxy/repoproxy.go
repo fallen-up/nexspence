@@ -39,18 +39,37 @@ import (
 // for env-configured proxies the guard still applies, so internal proxies must
 // be set via per-repo proxy_config or SetGlobalProxy (see proxyclient.go),
 // which route through a client that permits the trusted proxy address.
+//
+// It carries no overall Client.Timeout. That field bounds the ENTIRE
+// round trip — connect through the last byte of the body — which is wrong for
+// a client whose job is to stream artifacts of whatever size an upstream
+// happens to publish: a real multi-gigabyte model checkpoint proxied live
+// against huggingface.co was cut off mid-transfer at a fixed 5-minute mark
+// (confirmed: gpt2-xl's real 6.4 GB model.safetensors, ~5.6 GB in when killed)
+// — not a timeout tied to how the transfer was actually going, just an
+// artificial ceiling on top of a streaming design that otherwise has none
+// (base.StoreArtifact and this package's own cache-fill both pipe bytes
+// through directly, never buffering a whole artifact in memory). Bounding
+// unresponsiveness instead of duration is Transport.ResponseHeaderTimeout
+// (connect + wait for headers, still 5 minutes) plus idleGuardedTransport
+// (idletimeout.go), which wraps every response body with the idle-timeout
+// watchdog at the transport level — so any caller of this client, not only
+// this package's own copy sites, is protected the same way.
 var UpstreamClient = &http.Client{
-	Transport: &http.Transport{
-		Proxy: envProxyFromRequest,
-		DialContext: (&net.Dialer{
-			Timeout: 10 * time.Second,
-			Control: netguard.DialControl,
-		}).DialContext,
-		MaxIdleConns:        128,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 15 * time.Second,
+	Transport: idleGuardedTransport{
+		Transport: &http.Transport{
+			Proxy: envProxyFromRequest,
+			DialContext: (&net.Dialer{
+				Timeout: 10 * time.Second,
+				Control: netguard.DialControl,
+			}).DialContext,
+			MaxIdleConns:          128,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ResponseHeaderTimeout: 5 * time.Minute,
+		},
+		idle: idleBodyTimeout,
 	},
-	Timeout: 5 * time.Minute,
 	CheckRedirect: func(_ *http.Request, via []*http.Request) error {
 		if len(via) >= 12 {
 			return fmt.Errorf("stopped after 12 redirects")
@@ -343,7 +362,9 @@ func serveCachedAsset(c *gin.Context, d formats.Deps, asset *domain.Asset, rc io
 // JoinURL percent-escapes whatever it is handed as a path — a "?" glued on would
 // arrive upstream as %3F, i.e. part of the digest, not a filter.
 //
-// The caller must close the response body.
+// The caller must close the response body. Its Body already guards against a
+// connection that answers and then goes silent (idleGuardedTransport, applied
+// to ClientFor(repo) at the transport level) — callers need not wrap it themselves.
 func FetchUpstreamOnce(ctx context.Context, repo *domain.Repository, upstreamPath, rawQuery string, hdr http.Header) (*http.Response, error) {
 	baseRemote, err := RemoteURL(repo)
 	if err != nil {
