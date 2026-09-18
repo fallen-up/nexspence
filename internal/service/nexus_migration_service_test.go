@@ -595,24 +595,63 @@ func TestNexusMigration_AssetFailureIsCountedNotFatal(t *testing.T) {
 	assert.NotNil(t, ok, "the good asset is still transferred")
 }
 
-func TestNexusMigration_ProxyRepositoriesTransferNoAssets(t *testing.T) {
+func TestNexusMigration_ProxyCacheIsCopied(t *testing.T) {
 	fake := &fakeNexus{
 		settings: `[{"name":"maven-central","format":"maven2","type":"proxy","online":true,
 			"proxy":{"remoteUrl":"https://repo1.maven.org/maven2"}}]`,
 		components: map[string]string{
 			"maven-central": `{"items":[{"name":"cached","version":"1","group":"c","format":"maven2","assets":[
-				{"path":"c/cached/1/cached-1.jar","downloadUrl":"%BASE%/repository/maven-central/x","fileSize":1}]}],
+				{"path":"c/cached/1/cached-1.jar","downloadUrl":"%BASE%/repository/maven-central/c/cached/1/cached-1.jar","fileSize":3}]}],
 				"continuationToken":null}`,
 		},
+		files: map[string]string{"/repository/maven-central/c/cached/1/cached-1.jar": "jar"},
 	}
 	h := newMigHarness(t, fake)
 	fake.components["maven-central"] = strings.ReplaceAll(fake.components["maven-central"], "%BASE%", h.nexus.URL)
 
 	job := h.startJob(t)
 	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
-	assert.Equal(t, int64(0), done.TotalAssets,
-		"a proxy repository re-fetches from its own upstream; its cache is not migrated")
-	assert.Zero(t, fake.count("/service/rest/v1/components"))
+	assert.Zero(t, done.ErrorCount)
+	assert.Equal(t, int64(1), done.DoneAssets)
+
+	stored, err := h.assets.GetByPath(context.Background(), "maven-central", "/c/cached/1/cached-1.jar")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	body, err := h.blobs.Read(base.BlobKey("maven-central", "/c/cached/1/cached-1.jar"))
+	require.NoError(t, err)
+	assert.Equal(t, "jar", body)
+}
+
+func TestNexusMigration_ProxyCatalogFilesAreCopied(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[{"name":"helm-proxy","format":"helm","type":"proxy","online":true,
+			"proxy":{"remoteUrl":"https://charts.example.com"}}]`,
+		components: map[string]string{
+			"helm-proxy": `{"items":[],"continuationToken":null}`,
+		},
+		assetPages: map[string]string{
+			"helm-proxy": `{"items":[
+				{"path":"index.yaml","downloadUrl":"%BASE%/repository/helm-proxy/index.yaml","contentType":"text/yaml","fileSize":4}
+			],"continuationToken":null}`,
+		},
+		files: map[string]string{"/repository/helm-proxy/index.yaml": "idx\n"},
+	}
+	h := newMigHarness(t, fake)
+	fake.assetPages["helm-proxy"] = strings.ReplaceAll(fake.assetPages["helm-proxy"], "%BASE%", h.nexus.URL)
+
+	job := h.startJob(t, func(j *domain.MigrationJob) {
+		j.MigrateUsers = false
+		j.MigratePrivileges = false
+		j.MigrateRoles = false
+		j.MigrateRoutingRules = false
+	})
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+	assert.Zero(t, done.ErrorCount)
+	assert.Equal(t, int64(1), done.DoneAssets)
+
+	stored, err := h.assets.GetByPath(context.Background(), "helm-proxy", "/index.yaml")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
 }
 
 // ── OCI registry transfer ────────────────────────────────────────────────────
@@ -1233,6 +1272,323 @@ func TestNexusMigration_BlobsOffStillCreatesRepositories(t *testing.T) {
 	assert.Zero(t, fake.count("/service/rest/v1/components"))
 }
 
+func TestNexusMigration_BlobsOnlyCopiesIntoExistingHosted(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[{"name":"raw-hosted","format":"raw","type":"hosted","online":true}]`,
+		components: map[string]string{
+			"raw-hosted": `{"items":[{"name":"a.txt","version":null,"group":"/","format":"raw","assets":[
+				{"path":"a.txt","downloadUrl":"%BASE%/repository/raw-hosted/a.txt",
+				 "contentType":"text/plain","fileSize":5}]}],"continuationToken":null}`,
+		},
+		files: map[string]string{"/repository/raw-hosted/a.txt": "hello"},
+	}
+	h := newMigHarness(t, fake)
+	fake.components["raw-hosted"] = strings.ReplaceAll(fake.components["raw-hosted"], "%BASE%", h.nexus.URL)
+
+	require.NoError(t, h.repos.Create(context.Background(), &domain.Repository{
+		Name: "raw-hosted", Format: domain.FormatRaw, Type: domain.TypeHosted, Online: true,
+	}))
+
+	job := h.startJob(t, func(j *domain.MigrationJob) {
+		j.MigrateRepos = false
+		j.MigrateUsers = false
+		j.MigratePrivileges = false
+		j.MigrateRoles = false
+		j.MigrateRoutingRules = false
+	})
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+	assert.Zero(t, done.ErrorCount)
+	assert.Equal(t, int64(1), done.DoneAssets)
+	assert.Equal(t, 1, done.TotalRepos)
+	assert.Equal(t, 1, done.DoneRepos)
+
+	stored, err := h.assets.GetByPath(context.Background(), "raw-hosted", "/a.txt")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	body, err := h.blobs.Read(base.BlobKey("raw-hosted", "/a.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "hello", body)
+}
+
+func TestNexusMigration_BlobsOnlySkipsMissingDestination(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[{"name":"raw-hosted","format":"raw","type":"hosted","online":true}]`,
+		components: map[string]string{
+			"raw-hosted": `{"items":[{"name":"a.txt","version":null,"group":"/","format":"raw","assets":[
+				{"path":"a.txt","downloadUrl":"%BASE%/repository/raw-hosted/a.txt","fileSize":5}]}],"continuationToken":null}`,
+		},
+		files: map[string]string{"/repository/raw-hosted/a.txt": "hello"},
+	}
+	h := newMigHarness(t, fake)
+	job := h.startJob(t, func(j *domain.MigrationJob) {
+		j.MigrateRepos = false
+		j.MigrateUsers = false
+		j.MigratePrivileges = false
+		j.MigrateRoles = false
+		j.MigrateRoutingRules = false
+	})
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+
+	_, err := h.repos.Get(context.Background(), "raw-hosted")
+	assert.Error(t, err, "blobs-only must not create the destination")
+	assert.Equal(t, int64(0), done.DoneAssets)
+	assert.Positive(t, done.ErrorCount)
+	require.NotNil(t, done.LastError)
+	assert.Contains(t, *done.LastError, "destination does not exist")
+	assert.Zero(t, fake.count("/service/rest/v1/components"))
+}
+
+func TestNexusMigration_BlobsOnlyAllowlistCopiesOnlySelectedExisting(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[
+			{"name":"keep-hosted","format":"raw","type":"hosted","online":true},
+			{"name":"skip-hosted","format":"raw","type":"hosted","online":true},
+			{"name":"maven-central","format":"maven2","type":"proxy","online":true,
+			 "proxy":{"remoteUrl":"https://repo1.maven.org/maven2"}}
+		]`,
+		components: map[string]string{
+			"keep-hosted": `{"items":[{"name":"keep.txt","version":null,"group":"/","format":"raw","assets":[
+				{"path":"keep.txt","downloadUrl":"%BASE%/repository/keep-hosted/keep.txt","fileSize":4}]}],"continuationToken":null}`,
+			"skip-hosted": `{"items":[{"name":"skip.txt","version":null,"group":"/","format":"raw","assets":[
+				{"path":"skip.txt","downloadUrl":"%BASE%/repository/skip-hosted/skip.txt","fileSize":4}]}],"continuationToken":null}`,
+		},
+		files: map[string]string{
+			"/repository/keep-hosted/keep.txt": "keep",
+			"/repository/skip-hosted/skip.txt": "skip",
+		},
+	}
+	h := newMigHarness(t, fake)
+	for name, body := range fake.components {
+		fake.components[name] = strings.ReplaceAll(body, "%BASE%", h.nexus.URL)
+	}
+	ctx := context.Background()
+	require.NoError(t, h.repos.Create(ctx, &domain.Repository{
+		Name: "keep-hosted", Format: domain.FormatRaw, Type: domain.TypeHosted, Online: true,
+	}))
+	require.NoError(t, h.repos.Create(ctx, &domain.Repository{
+		Name: "skip-hosted", Format: domain.FormatRaw, Type: domain.TypeHosted, Online: true,
+	}))
+
+	job := h.startJob(t, func(j *domain.MigrationJob) {
+		j.MigrateRepos = false
+		j.Repositories = []string{"keep-hosted"}
+		j.MigrateUsers = false
+		j.MigratePrivileges = false
+		j.MigrateRoles = false
+		j.MigrateRoutingRules = false
+	})
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+	assert.Zero(t, done.ErrorCount)
+	assert.Equal(t, int64(1), done.DoneAssets)
+
+	_, err := h.assets.GetByPath(ctx, "keep-hosted", "/keep.txt")
+	require.NoError(t, err)
+	_, err = h.assets.GetByPath(ctx, "skip-hosted", "/skip.txt")
+	assert.Error(t, err)
+}
+
+func TestNexusMigration_BlobsOnlySkipsNonHostedDestination(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[{"name":"raw-hosted","format":"raw","type":"hosted","online":true}]`,
+	}
+	h := newMigHarness(t, fake)
+	require.NoError(t, h.repos.Create(context.Background(), &domain.Repository{
+		Name: "raw-hosted", Format: domain.FormatRaw, Type: domain.TypeProxy, Online: true,
+	}))
+
+	job := h.startJob(t, func(j *domain.MigrationJob) {
+		j.MigrateRepos = false
+		j.MigrateUsers = false
+		j.MigratePrivileges = false
+		j.MigrateRoles = false
+		j.MigrateRoutingRules = false
+	})
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+	assert.Equal(t, int64(0), done.DoneAssets)
+	assert.Positive(t, done.ErrorCount)
+	require.NotNil(t, done.LastError)
+	assert.Contains(t, *done.LastError, "source is hosted")
+	assert.Zero(t, fake.count("/service/rest/v1/components"))
+}
+
+func TestNexusMigration_BlobsOnlySkipsUnsupportedFormat(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[{"name":"bower-things","format":"bower","type":"hosted","online":true}]`,
+	}
+	h := newMigHarness(t, fake)
+	job := h.startJob(t, func(j *domain.MigrationJob) {
+		j.MigrateRepos = false
+		j.MigrateUsers = false
+		j.MigratePrivileges = false
+		j.MigrateRoles = false
+		j.MigrateRoutingRules = false
+	})
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+	assert.Equal(t, int64(0), done.DoneAssets)
+	assert.Positive(t, done.ErrorCount)
+	require.NotNil(t, done.LastError)
+	assert.Contains(t, *done.LastError, "bower")
+}
+
+func TestNexusMigration_RepositoryAllowlistLimitsCreateAndBlobs(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[
+			{"name":"keep-hosted","format":"raw","type":"hosted","online":true},
+			{"name":"skip-hosted","format":"raw","type":"hosted","online":true}
+		]`,
+		components: map[string]string{
+			"keep-hosted": `{"items":[{"name":"keep.txt","version":null,"group":"/","format":"raw","assets":[
+				{"path":"keep.txt","downloadUrl":"%BASE%/repository/keep-hosted/keep.txt","fileSize":4}]}],"continuationToken":null}`,
+			"skip-hosted": `{"items":[{"name":"skip.txt","version":null,"group":"/","format":"raw","assets":[
+				{"path":"skip.txt","downloadUrl":"%BASE%/repository/skip-hosted/skip.txt","fileSize":4}]}],"continuationToken":null}`,
+		},
+		files: map[string]string{
+			"/repository/keep-hosted/keep.txt": "keep",
+			"/repository/skip-hosted/skip.txt": "skip",
+		},
+	}
+	h := newMigHarness(t, fake)
+	for name, body := range fake.components {
+		fake.components[name] = strings.ReplaceAll(body, "%BASE%", h.nexus.URL)
+	}
+
+	job := h.startJob(t, func(j *domain.MigrationJob) {
+		j.Repositories = []string{"keep-hosted"}
+		j.MigrateUsers = false
+		j.MigratePrivileges = false
+		j.MigrateRoles = false
+		j.MigrateRoutingRules = false
+	})
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+	assert.Equal(t, 1, done.TotalRepos)
+	assert.Equal(t, 1, done.DoneRepos)
+	assert.Equal(t, int64(1), done.DoneAssets)
+	assert.Zero(t, done.ErrorCount)
+
+	ctx := context.Background()
+	_, err := h.repos.Get(ctx, "keep-hosted")
+	require.NoError(t, err)
+	_, err = h.repos.Get(ctx, "skip-hosted")
+	assert.Error(t, err)
+
+	_, err = h.assets.GetByPath(ctx, "keep-hosted", "/keep.txt")
+	require.NoError(t, err)
+	_, err = h.assets.GetByPath(ctx, "skip-hosted", "/skip.txt")
+	assert.Error(t, err)
+}
+
+func TestNexusMigration_UnknownAllowlistNameIsCounted(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[{"name":"raw-hosted","format":"raw","type":"hosted","online":true}]`,
+	}
+	h := newMigHarness(t, fake)
+	job := h.startJob(t, func(j *domain.MigrationJob) {
+		j.Repositories = []string{"raw-hosted", "does-not-exist"}
+		j.MigrateBlobs = false
+		j.MigrateUsers = false
+		j.MigratePrivileges = false
+		j.MigrateRoles = false
+		j.MigrateRoutingRules = false
+	})
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+	assert.Equal(t, 1, done.DoneRepos)
+	assert.Positive(t, done.ErrorCount)
+	require.NotNil(t, done.LastError)
+	assert.Contains(t, *done.LastError, "does-not-exist")
+}
+
+func TestNexusMigration_BlobsOnlySkipsFormatMismatch(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[{"name":"raw-hosted","format":"raw","type":"hosted","online":true}]`,
+		components: map[string]string{
+			"raw-hosted": `{"items":[{"name":"a.txt","version":null,"group":"/","format":"raw","assets":[
+				{"path":"a.txt","downloadUrl":"%BASE%/repository/raw-hosted/a.txt","fileSize":5}]}],"continuationToken":null}`,
+		},
+		files: map[string]string{"/repository/raw-hosted/a.txt": "hello"},
+	}
+	h := newMigHarness(t, fake)
+	require.NoError(t, h.repos.Create(context.Background(), &domain.Repository{
+		Name: "raw-hosted", Format: domain.FormatNPM, Type: domain.TypeHosted, Online: true,
+	}))
+
+	job := h.startJob(t, func(j *domain.MigrationJob) {
+		j.MigrateRepos = false
+		j.MigrateUsers = false
+		j.MigratePrivileges = false
+		j.MigrateRoles = false
+		j.MigrateRoutingRules = false
+	})
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+	assert.Equal(t, int64(0), done.DoneAssets)
+	assert.Positive(t, done.ErrorCount)
+	require.NotNil(t, done.LastError)
+	assert.Contains(t, *done.LastError, "destination format")
+	assert.Zero(t, fake.count("/service/rest/v1/components"))
+}
+
+func TestNexusMigration_ReposAndBlobsSkipExistingNonHostedDest(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[{"name":"raw-hosted","format":"raw","type":"hosted","online":true}]`,
+		components: map[string]string{
+			"raw-hosted": `{"items":[{"name":"a.txt","version":null,"group":"/","format":"raw","assets":[
+				{"path":"a.txt","downloadUrl":"%BASE%/repository/raw-hosted/a.txt","fileSize":5}]}],"continuationToken":null}`,
+		},
+		files: map[string]string{"/repository/raw-hosted/a.txt": "hello"},
+	}
+	h := newMigHarness(t, fake)
+	require.NoError(t, h.repos.Create(context.Background(), &domain.Repository{
+		Name: "raw-hosted", Format: domain.FormatRaw, Type: domain.TypeProxy, Online: true,
+	}))
+
+	job := h.startJob(t, func(j *domain.MigrationJob) {
+		j.MigrateUsers = false
+		j.MigratePrivileges = false
+		j.MigrateRoles = false
+		j.MigrateRoutingRules = false
+	})
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+	assert.Equal(t, int64(0), done.DoneAssets)
+	assert.Positive(t, done.ErrorCount)
+	require.NotNil(t, done.LastError)
+	assert.Contains(t, *done.LastError, "source is hosted")
+	assert.Zero(t, fake.count("/service/rest/v1/components"))
+}
+
+func TestNexusMigration_GroupAllowlistAlsoMigratesMembers(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[
+			{"name":"raw-hosted","format":"raw","type":"hosted","online":true},
+			{"name":"raw-group","format":"raw","type":"group","online":true,
+			 "group":{"memberNames":["raw-hosted"]}}
+		]`,
+		components: map[string]string{
+			"raw-hosted": `{"items":[{"name":"a.txt","version":null,"group":"/","format":"raw","assets":[
+				{"path":"a.txt","downloadUrl":"%BASE%/repository/raw-hosted/a.txt","fileSize":5}]}],"continuationToken":null}`,
+		},
+		files: map[string]string{"/repository/raw-hosted/a.txt": "hello"},
+	}
+	h := newMigHarness(t, fake)
+	fake.components["raw-hosted"] = strings.ReplaceAll(fake.components["raw-hosted"], "%BASE%", h.nexus.URL)
+
+	job := h.startJob(t, func(j *domain.MigrationJob) {
+		j.Repositories = []string{"raw-group"}
+		j.MigrateUsers = false
+		j.MigratePrivileges = false
+		j.MigrateRoles = false
+		j.MigrateRoutingRules = false
+	})
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+	ctx := context.Background()
+	_, err := h.repos.Get(ctx, "raw-group")
+	require.NoError(t, err)
+	_, err = h.repos.Get(ctx, "raw-hosted")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), done.DoneAssets)
+	stored, err := h.assets.GetByPath(ctx, "raw-hosted", "/a.txt")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+}
+
 // ── lifecycle ────────────────────────────────────────────────────────────────
 
 func TestNexusMigration_PauseStopsTheRunAndResumeFinishesIt(t *testing.T) {
@@ -1492,6 +1848,138 @@ func TestNexusMigration_MavenMetadataAssetsAreNotErrors(t *testing.T) {
 
 	assert.Zero(t, done.ErrorCount,
 		"maven-metadata.xml is generated dynamically, its absence from the plan is by design: %v", done.LastError)
+}
+
+func TestNexusMigration_NpmPackumentIsNotAnError(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[{"name":"npm-hosted","format":"npm","type":"hosted","online":true}]`,
+		components: map[string]string{
+			"npm-hosted": `{"items":[{"name":"@evidence-dev/duckdb-wasm-extensions","version":"1.1.1-vivid.64","group":"evidence-dev","format":"npm","assets":[
+				{"path":"@evidence-dev/duckdb-wasm-extensions/-/duckdb-wasm-extensions-1.1.1-vivid.64.tgz",
+				 "downloadUrl":"%BASE%/repository/npm-hosted/@evidence-dev/duckdb-wasm-extensions/-/duckdb-wasm-extensions-1.1.1-vivid.64.tgz",
+				 "contentType":"application/octet-stream","fileSize":3}]}],"continuationToken":null}`,
+		},
+		assetPages: map[string]string{
+			"npm-hosted": `{"items":[
+				{"path":"@evidence-dev/duckdb-wasm-extensions/-/duckdb-wasm-extensions-1.1.1-vivid.64.tgz","downloadUrl":"%BASE%/repository/npm-hosted/@evidence-dev/duckdb-wasm-extensions/-/duckdb-wasm-extensions-1.1.1-vivid.64.tgz","contentType":"application/octet-stream","fileSize":3},
+				{"path":"@evidence-dev/duckdb-wasm-extensions","downloadUrl":"%BASE%/repository/npm-hosted/@evidence-dev/duckdb-wasm-extensions","contentType":"application/json","fileSize":20}
+			],"continuationToken":null}`,
+		},
+		files: map[string]string{
+			"/repository/npm-hosted/@evidence-dev/duckdb-wasm-extensions/-/duckdb-wasm-extensions-1.1.1-vivid.64.tgz": "tgz",
+		},
+	}
+	h := newMigHarness(t, fake)
+	fake.components["npm-hosted"] = strings.ReplaceAll(fake.components["npm-hosted"], "%BASE%", h.nexus.URL)
+	fake.assetPages["npm-hosted"] = strings.ReplaceAll(fake.assetPages["npm-hosted"], "%BASE%", h.nexus.URL)
+
+	job := h.startJob(t)
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+
+	assert.Zero(t, done.ErrorCount)
+	require.Nil(t, done.LastError)
+	assert.Equal(t, int64(1), done.DoneAssets)
+
+	stored, err := h.assets.GetByPath(context.Background(), "npm-hosted",
+		"/@evidence-dev/duckdb-wasm-extensions/-/duckdb-wasm-extensions-1.1.1-vivid.64.tgz")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+}
+
+func TestNexusMigration_PypiSimpleIndexIsNotAnError(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[{"name":"pypi-hosted","format":"pypi","type":"hosted","online":true}]`,
+		components: map[string]string{
+			"pypi-hosted": `{"items":[{"name":"cc-notifications-client","version":"0.1.3","group":"","format":"pypi","assets":[
+				{"path":"packages/cc-notifications-client/0.1.3/cc_notifications_client-0.1.3-py3-none-any.whl",
+				 "downloadUrl":"%BASE%/repository/pypi-hosted/packages/cc-notifications-client/0.1.3/cc_notifications_client-0.1.3-py3-none-any.whl",
+				 "contentType":"application/zip","fileSize":3}]}],"continuationToken":null}`,
+		},
+		assetPages: map[string]string{
+			"pypi-hosted": `{"items":[
+				{"path":"packages/cc-notifications-client/0.1.3/cc_notifications_client-0.1.3-py3-none-any.whl","downloadUrl":"%BASE%/repository/pypi-hosted/packages/cc-notifications-client/0.1.3/cc_notifications_client-0.1.3-py3-none-any.whl","contentType":"application/zip","fileSize":3},
+				{"path":"/simple/cc-notifications-client/","downloadUrl":"%BASE%/repository/pypi-hosted/simple/cc-notifications-client/","contentType":"text/html","fileSize":40}
+			],"continuationToken":null}`,
+		},
+		files: map[string]string{
+			"/repository/pypi-hosted/packages/cc-notifications-client/0.1.3/cc_notifications_client-0.1.3-py3-none-any.whl": "whl",
+		},
+	}
+	h := newMigHarness(t, fake)
+	fake.components["pypi-hosted"] = strings.ReplaceAll(fake.components["pypi-hosted"], "%BASE%", h.nexus.URL)
+	fake.assetPages["pypi-hosted"] = strings.ReplaceAll(fake.assetPages["pypi-hosted"], "%BASE%", h.nexus.URL)
+
+	job := h.startJob(t)
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+
+	assert.Zero(t, done.ErrorCount)
+	require.Nil(t, done.LastError)
+	assert.Equal(t, int64(1), done.DoneAssets)
+
+	stored, err := h.assets.GetByPath(context.Background(), "pypi-hosted",
+		"/packages/cc-notifications-client/cc_notifications_client-0.1.3-py3-none-any.whl")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+}
+
+func TestNexusMigration_PypiPackagesCopiedWhenMissingFromComponentsAPI(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[{"name":"pypi-hosted","format":"pypi","type":"hosted","online":true}]`,
+		components: map[string]string{
+			"pypi-hosted": `{"items":[{"name":"cc-notifications-client","version":"0.1.3","group":"","format":"pypi","assets":[]}],"continuationToken":null}`,
+		},
+		assetPages: map[string]string{
+			"pypi-hosted": `{"items":[
+				{"path":"packages/cc-notifications-client/0.1.3/cc_notifications_client-0.1.3.tar.gz","downloadUrl":"%BASE%/repository/pypi-hosted/packages/cc-notifications-client/0.1.3/cc_notifications_client-0.1.3.tar.gz","contentType":"application/x-gzip","fileSize":3},
+				{"path":"/simple/cc-notifications-client/","downloadUrl":"%BASE%/repository/pypi-hosted/simple/cc-notifications-client/","contentType":"text/html","fileSize":40}
+			],"continuationToken":null}`,
+		},
+		files: map[string]string{
+			"/repository/pypi-hosted/packages/cc-notifications-client/0.1.3/cc_notifications_client-0.1.3.tar.gz": "src",
+		},
+	}
+	h := newMigHarness(t, fake)
+	fake.assetPages["pypi-hosted"] = strings.ReplaceAll(fake.assetPages["pypi-hosted"], "%BASE%", h.nexus.URL)
+
+	job := h.startJob(t)
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+
+	assert.Zero(t, done.ErrorCount)
+	require.Nil(t, done.LastError)
+	assert.Equal(t, int64(1), done.DoneAssets)
+
+	stored, err := h.assets.GetByPath(context.Background(), "pypi-hosted",
+		"/packages/cc-notifications-client/cc_notifications_client-0.1.3.tar.gz")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+}
+
+func TestNexusMigration_HelmIndexYamlIsNotAnError(t *testing.T) {
+	fake := &fakeNexus{
+		settings: `[{"name":"helm-hosted","format":"helm","type":"hosted","online":true}]`,
+		components: map[string]string{
+			"helm-hosted": `{"items":[],"continuationToken":null}`,
+		},
+		assetPages: map[string]string{
+			"helm-hosted": `{"items":[
+				{"path":"index.yaml","downloadUrl":"%BASE%/repository/helm-hosted/index.yaml","contentType":"text/yaml","fileSize":20}
+			],"continuationToken":null}`,
+		},
+	}
+	h := newMigHarness(t, fake)
+	fake.assetPages["helm-hosted"] = strings.ReplaceAll(fake.assetPages["helm-hosted"], "%BASE%", h.nexus.URL)
+
+	job := h.startJob(t, func(j *domain.MigrationJob) {
+		j.MigrateUsers = false
+		j.MigratePrivileges = false
+		j.MigrateRoles = false
+		j.MigrateRoutingRules = false
+	})
+	done := h.waitForStatus(t, job.ID, domain.MigrationDone)
+
+	assert.Zero(t, done.ErrorCount)
+	require.Nil(t, done.LastError)
+	assert.Equal(t, int64(0), done.DoneAssets)
 }
 
 // An older Nexus without the assets endpoint (or a hardened one refusing it)

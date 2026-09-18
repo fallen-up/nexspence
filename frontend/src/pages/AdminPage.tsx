@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState, lazy, Suspense } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Activity, Archive, ArrowRightLeft, ArrowUpCircle, CheckCircle, Database, Download, ExternalLink, GitBranch, HardDrive, Info, Network, Paperclip, Pause, Pencil, Play, Plus, RefreshCw, Share2, Shield, Trash2, Upload, Wifi, X } from 'lucide-react'
+import { Activity, Archive, ArrowRightLeft, ArrowUpCircle, CheckCircle, ChevronDown, ChevronUp, Database, Download, ExternalLink, GitBranch, HardDrive, Info, Network, Paperclip, Pause, Pencil, Play, Plus, RefreshCw, Share2, Shield, Trash2, Upload, Wifi, X } from 'lucide-react'
 import { nexusApi, nexspenceApi, apiClient, apiErrorMessage, ImportRepoStats, ServiceStatus, RoutingRule, RoutingRuleInput, ReplicationRule, ReplicationHistory, ReplicationRuleInput, AuthConfig } from '@/api/client'
 const MonitoringView = lazy(() => import('@/pages/MonitoringPage').then(m => ({ default: m.MonitoringView })))
 import { Select } from '@/components/Select'
 import { Truncated } from '@/components/Truncated'
 import { HoloButton, HoloInput, HoloModal, HoloTabs, HoloCard, HoloTabItem, Wizard } from '@/components/holo'
+import { MigrationRepoPicker, isBlobSourceRepo, scopedRepoSelection, validateMigrationRepoScope, type PreviewRepo } from '@/pages/MigrationRepoPicker'
 
 interface BlobStore {
   id: string; name: string; type: string; usedBytes: number; quotaBytes?: number; config?: Record<string, unknown>
@@ -2441,6 +2442,7 @@ interface MigrationJobData {
   assetsDone: number
   errorCount: number
   lastError?: string
+  repositories?: string[]
   startedAt?: string
   finishedAt?: string
   createdAt: string
@@ -2495,8 +2497,10 @@ function MigrationTab() {
 
       <div style={{ background: 'rgba(124,92,255,0.08)', border: '1px solid rgba(124,92,255,0.2)', borderRadius: 10, padding: '12px 16px', fontSize: 13, color: 'rgba(180,160,255,0.9)', lineHeight: 1.6 }}>
         <strong>How it works:</strong> Nexspence connects to your Nexus instance via its REST API and
-        streams repositories, users, roles and all artifacts directly — no downtime required.
-        Jobs are pausable and resumable. Requires Nexus admin credentials.
+        streams repositories, users, roles and artifacts directly — no downtime required.
+        Test the connection, then pick one or several repositories. Artifacts copy into hosted
+        and proxy destinations that already exist here, however they were created, so you can skip
+        Repositories when the matching repositories are already present. Jobs are pausable and resumable.
       </div>
 
       {isLoading ? (
@@ -2531,26 +2535,7 @@ function MigrationTab() {
                   <div>Assets</div>
                   <div>Finished</div>
                 </div>
-                {historyJobs.map(job => {
-                  const st = MIG_STATUS[job.status] ?? MIG_STATUS.pending
-                  return (
-                    <div key={job.id} style={{ display: 'grid', gridTemplateColumns: '3fr 1fr 1fr 1fr 1fr', padding: '11px 16px', borderBottom: '1px solid rgba(255,255,255,0.04)', fontSize: 13, color: 'var(--holo-text)', alignItems: 'center' }}>
-                      <div>
-                        <Truncated text={job.sourceUrl} style={{ fontFamily: 'monospace', fontSize: 12, fontWeight: 600, color: 'var(--holo-text)' }} />
-                        {job.sourceUser && <div style={{ fontSize: 11, color: 'var(--holo-text-faint)', marginTop: 2 }}>{job.sourceUser}</div>}
-                      </div>
-                      <div>
-                        <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 4, background: st.bg, color: st.color }}>{job.status}</span>
-                        {job.errorCount > 0 && <div style={{ fontSize: 11, color: '#ef4444', marginTop: 3 }}>{job.errorCount} errors</div>}
-                      </div>
-                      <div style={{ fontSize: 13 }}>{job.repositoriesDone}/{job.repositoriesTotal || '?'}</div>
-                      <div style={{ fontSize: 13 }}>{job.assetsDone.toLocaleString()}/{job.assetsTotal ? job.assetsTotal.toLocaleString() : '?'}</div>
-                      <div style={{ fontSize: 12, color: 'var(--holo-text-faint)' }}>
-                        {job.finishedAt ? new Date(job.finishedAt).toLocaleString() : job.updatedAt ? new Date(job.updatedAt).toLocaleString() : '—'}
-                      </div>
-                    </div>
-                  )
-                })}
+                {historyJobs.map(job => <MigrationHistoryRow key={job.id} job={job} />)}
               </div>
             </>
           )}
@@ -2570,6 +2555,51 @@ function MigrationTab() {
   )
 }
 
+function MigrationHistoryRow({ job }: { job: MigrationJobData }) {
+  const [open, setOpen] = useState(false)
+  const st = MIG_STATUS[job.status] ?? MIG_STATUS.pending
+  const canReveal = job.errorCount > 0 && Boolean(job.lastError)
+  const Chevron = open ? ChevronUp : ChevronDown
+  return (
+    <div style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '3fr 1fr 1fr 1fr 1fr', padding: '11px 16px', fontSize: 13, color: 'var(--holo-text)', alignItems: 'center' }}>
+        <div>
+          <Truncated text={job.sourceUrl} style={{ fontFamily: 'monospace', fontSize: 12, fontWeight: 600, color: 'var(--holo-text)' }} />
+          {job.sourceUser && <div style={{ fontSize: 11, color: 'var(--holo-text-faint)', marginTop: 2 }}>{job.sourceUser}</div>}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 3 }}>
+          <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 4, background: st.bg, color: st.color }}>{job.status}</span>
+          {canReveal ? (
+            <button
+              type="button"
+              onClick={() => setOpen(v => !v)}
+              aria-expanded={open}
+              aria-label={`${job.errorCount} errors`}
+              style={{ display: 'flex', alignItems: 'center', gap: 2, padding: 0, border: 0, background: 'none', font: 'inherit', fontSize: 11, fontWeight: 600, color: '#ef4444', cursor: 'pointer' }}
+            >
+              {job.errorCount} errors
+              <Chevron size={14} aria-hidden="true" />
+            </button>
+          ) : job.errorCount > 0 ? (
+            <div style={{ fontSize: 11, color: '#ef4444' }}>{job.errorCount} errors</div>
+          ) : null}
+        </div>
+        <div style={{ fontSize: 13 }}>{job.repositoriesDone}/{job.repositoriesTotal || '?'}</div>
+        <div style={{ fontSize: 13 }}>{job.assetsDone.toLocaleString()}/{job.assetsTotal ? job.assetsTotal.toLocaleString() : '?'}</div>
+        <div style={{ fontSize: 12, color: 'var(--holo-text-faint)' }}>
+          {job.finishedAt ? new Date(job.finishedAt).toLocaleString() : job.updatedAt ? new Date(job.updatedAt).toLocaleString() : '—'}
+        </div>
+      </div>
+      {open && job.lastError && (
+        <div style={{ margin: '0 16px 12px', background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)', borderRadius: 8, padding: '8px 12px' }}>
+          <div style={{ fontSize: 11, fontWeight: 600, color: '#ef4444', marginBottom: 4 }}>Last error</div>
+          <div style={{ fontSize: 12, color: '#fca5a5', wordBreak: 'break-word', fontFamily: 'monospace' }}>{job.lastError}</div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function MigrationJobCard({ job, onPause, onResume }: { job: MigrationJobData; onPause: () => void; onResume: () => void }) {
   const reposPct = job.repositoriesTotal ? Math.round((job.repositoriesDone / job.repositoriesTotal) * 100) : 0
   const assetsPct = job.assetsTotal ? Math.round((job.assetsDone / job.assetsTotal) * 100) : 0
@@ -2577,7 +2607,6 @@ function MigrationJobCard({ job, onPause, onResume }: { job: MigrationJobData; o
   return (
     <HoloCard style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-        <ArrowRightLeft size={15} style={{ color: 'var(--holo-text-faint)', flexShrink: 0 }} />
         <span style={{ flex: 1, fontSize: 14, fontWeight: 600, color: 'var(--holo-text)', fontFamily: 'monospace', wordBreak: 'break-all' }}>{job.sourceUrl}</span>
         <span style={{ fontSize: 11, fontWeight: 600, padding: '3px 9px', borderRadius: 4, background: st.bg, color: st.color }}>{job.status}</span>
       </div>
@@ -2591,9 +2620,15 @@ function MigrationJobCard({ job, onPause, onResume }: { job: MigrationJobData; o
         ].map(s => (
           <span key={s.label} style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, background: s.on ? 'rgba(59,130,246,0.15)' : 'rgba(255,255,255,0.04)', color: s.on ? '#3b82f6' : 'var(--holo-text-faint)', fontWeight: 600 }}>{s.label}</span>
         ))}
+        {job.repositories && job.repositories.length > 0 && (
+          <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, background: 'rgba(124,92,255,0.15)', color: '#a78bfa', fontWeight: 600 }} title={job.repositories.join(', ')}>
+            {job.repositories.length === 1 ? job.repositories[0] : `${job.repositories.length} selected`}
+          </span>
+        )}
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: job.migrateRepos ? 'repeat(3, 1fr)' : '1fr 1fr', gap: 12 }}>
+        {job.migrateRepos && (
         <div style={{ background: 'rgba(255,255,255,0.02)', borderRadius: 8, padding: '10px 12px' }}>
           <div style={{ fontSize: 11, color: 'var(--holo-text-faint)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Repositories</div>
           <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--holo-text)' }}>{job.repositoriesDone}<span style={{ fontSize: 13, color: 'var(--holo-text-faint)', fontWeight: 400 }}>/{job.repositoriesTotal || '?'}</span></div>
@@ -2601,6 +2636,7 @@ function MigrationJobCard({ job, onPause, onResume }: { job: MigrationJobData; o
             <div style={{ height: '100%', width: reposPct + '%', background: 'var(--holo-a)', transition: 'width 0.4s' }} />
           </div>
         </div>
+        )}
         <div style={{ background: 'rgba(255,255,255,0.02)', borderRadius: 8, padding: '10px 12px' }}>
           <div style={{ fontSize: 11, color: 'var(--holo-text-faint)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Assets</div>
           <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--holo-text)' }}>{job.assetsDone}<span style={{ fontSize: 13, color: 'var(--holo-text-faint)', fontWeight: 400 }}>/{job.assetsTotal || '?'}</span></div>
@@ -2613,6 +2649,12 @@ function MigrationJobCard({ job, onPause, onResume }: { job: MigrationJobData; o
           <div style={{ fontSize: 18, fontWeight: 700, color: job.errorCount > 0 ? '#ef4444' : '#22c55e' }}>{job.errorCount}</div>
         </div>
       </div>
+
+      {job.lastError && (
+        <div style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)', borderRadius: 8, padding: '8px 12px', fontSize: 12, color: '#fca5a5', wordBreak: 'break-word' }}>
+          {job.lastError}
+        </div>
+      )}
 
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <span style={{ fontSize: 12, color: 'var(--holo-text-faint)' }}>Started {job.startedAt ? new Date(job.startedAt).toLocaleString() : new Date(job.createdAt).toLocaleString()}</span>
@@ -2634,27 +2676,79 @@ function CreateMigrationJobModal({ onClose, onCreated }: { onClose: () => void; 
   })
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [preview, setPreview] = useState<{ reachable: boolean; repoCount: number; repos: PreviewRepo[] } | null>(null)
+  const [previewError, setPreviewError] = useState('')
+  const [selectedRepos, setSelectedRepos] = useState<string[]>([])
+  const testReqSeq = useRef(0)
 
-  const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) =>
+  const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) => {
+    testReqSeq.current++
+    setPreview(null)
+    setPreviewError('')
+    setSelectedRepos([])
     setForm(f => ({ ...f, [k]: e.target.value }))
+  }
 
   const toggleScope = (k: keyof typeof scope) =>
     setScope(s => ({ ...s, [k]: !s[k] }))
+
+  const handleTest = async () => {
+    const seq = ++testReqSeq.current
+    setPreview(null)
+    setPreviewError('')
+    setTesting(true)
+    try {
+      const { data } = await nexspenceApi.previewMigration({
+        sourceUrl: form.sourceUrl,
+        username: form.username,
+        password: form.password,
+      })
+      if (seq !== testReqSeq.current) return
+      const result = data as { reachable: boolean; repoCount: number; repos: PreviewRepo[] }
+      setPreview(result)
+      setSelectedRepos([])
+    } catch (err) {
+      if (seq !== testReqSeq.current) return
+      setPreviewError(apiErrorMessage(err, 'Could not reach that Nexus'))
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  const wantsRepos = scope.migrateRepos || scope.migrateBlobs
+  const blobSourcesOnly = scope.migrateBlobs && !scope.migrateRepos
+  const pickerRepos = preview?.repos ?? []
+  const scopedSelected = scopedRepoSelection(pickerRepos, selectedRepos, blobSourcesOnly)
+
+  const repoScopeError = () => validateMigrationRepoScope({
+    migrateRepos: scope.migrateRepos,
+    migrateBlobs: scope.migrateBlobs,
+    previewed: !!preview,
+    previewRepoCount: blobSourcesOnly ? pickerRepos.filter(isBlobSourceRepo).length : pickerRepos.length,
+    selectedCount: scopedSelected.length,
+  })
 
   const validateStep = (stepIdx: number): boolean => {
     setError('')
     if (stepIdx === 0) {
       if (!form.sourceUrl.trim()) { setError('Nexus URL is required'); return false }
       if (!form.password.trim()) { setError('Password is required'); return false }
+      if (!preview) { setError('Test the connection before continuing'); return false }
     }
     if (stepIdx === 1) {
       if (!Object.values(scope).some(Boolean)) { setError('Select at least one scope item'); return false }
+      const repoErr = repoScopeError()
+      if (repoErr) { setError(repoErr); return false }
     }
     return true
   }
 
   const handleFinish = async () => {
     setError('')
+    if (!preview) { setError('Test the connection before continuing'); return }
+    const repoErr = repoScopeError()
+    if (repoErr) { setError(repoErr); return }
     setLoading(true)
     try {
       await nexspenceApi.createMigrationJob({
@@ -2665,6 +2759,7 @@ function CreateMigrationJobModal({ onClose, onCreated }: { onClose: () => void; 
           migrateUsers: scope.migrateUsers,
           migratePolicies: scope.migratePolicies,
           migrateBlobs: scope.migrateBlobs,
+          ...(preview ? { repositories: scopedSelected } : {}),
         },
       })
       onCreated()
@@ -2689,8 +2784,23 @@ function CreateMigrationJobModal({ onClose, onCreated }: { onClose: () => void; 
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         <label style={LABEL}>Nexus URL *</label>
-        <HoloInput placeholder="https://nexus.example.com" value={form.sourceUrl} onChange={set('sourceUrl')} autoFocus />
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <HoloInput style={{ flex: 1 }} placeholder="https://nexus.example.com" value={form.sourceUrl} onChange={set('sourceUrl')} autoFocus />
+          <HoloButton type="button" onClick={handleTest} disabled={testing || !form.sourceUrl}>
+            {testing ? 'Testing…' : 'Test connection'}
+          </HoloButton>
+        </div>
       </div>
+      {preview && (
+        <div style={{ background: 'rgba(34,197,94,0.1)', border: '1px solid rgba(34,197,94,0.25)', borderRadius: 8, padding: '10px 12px', color: '#86efac', fontSize: 13 }}>
+          Connected — {preview.repoCount} {preview.repoCount === 1 ? 'repository' : 'repositories'} found. Pick which ones on the next step.
+        </div>
+      )}
+      {previewError && (
+        <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.25)', borderRadius: 8, padding: '10px 12px', color: '#fca5a5', fontSize: 13, wordBreak: 'break-word' }}>
+          {previewError}
+        </div>
+      )}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
           <label style={LABEL}>Username</label>
@@ -2705,22 +2815,32 @@ function CreateMigrationJobModal({ onClose, onCreated }: { onClose: () => void; 
   )
 
   const step2 = (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-      <label style={LABEL}>Migration Scope</label>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-        {scopeItems.map(({ key, label }) => (
-          <label key={key} style={{
-            display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
-            padding: '8px 10px',
-            background: scope[key] ? 'rgba(59,130,246,0.1)' : 'rgba(255,255,255,0.03)',
-            border: `1px solid ${scope[key] ? 'rgba(59,130,246,0.3)' : 'rgba(255,255,255,0.08)'}`,
-            borderRadius: 8, transition: 'background 0.15s, border-color 0.15s', userSelect: 'none',
-          }}>
-            <input type="checkbox" checked={scope[key]} onChange={() => toggleScope(key)} style={{ accentColor: '#3b82f6', width: 14, height: 14 }} />
-            <span style={{ fontSize: 13, color: scope[key] ? 'var(--holo-text)' : 'var(--holo-text-faint)', fontWeight: scope[key] ? 600 : 400 }}>{label}</span>
-          </label>
-        ))}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <label style={LABEL}>Migration Scope</label>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+          {scopeItems.map(({ key, label }) => (
+            <label key={key} style={{
+              display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
+              padding: '8px 10px',
+              background: scope[key] ? 'rgba(59,130,246,0.1)' : 'rgba(255,255,255,0.03)',
+              border: `1px solid ${scope[key] ? 'rgba(59,130,246,0.3)' : 'rgba(255,255,255,0.08)'}`,
+              borderRadius: 8, transition: 'background 0.15s, border-color 0.15s', userSelect: 'none',
+            }}>
+              <input type="checkbox" checked={scope[key]} onChange={() => toggleScope(key)} style={{ accentColor: '#3b82f6', width: 14, height: 14 }} />
+              <span style={{ fontSize: 13, color: scope[key] ? 'var(--holo-text)' : 'var(--holo-text-faint)', fontWeight: scope[key] ? 600 : 400 }}>{label}</span>
+            </label>
+          ))}
+        </div>
       </div>
+      {wantsRepos && preview && preview.repos.length > 0 && (
+        <MigrationRepoPicker repos={preview.repos} selected={selectedRepos} onChange={setSelectedRepos} blobSourcesOnly={blobSourcesOnly} />
+      )}
+      {wantsRepos && !preview && (
+        <div style={{ fontSize: 12, color: 'var(--holo-text-faint)', lineHeight: 1.5 }}>
+          Test the connection on the previous step to pick repositories. Repositories and Artifacts cannot start without it.
+        </div>
+      )}
     </div>
   )
 
@@ -2738,6 +2858,16 @@ function CreateMigrationJobModal({ onClose, onCreated }: { onClose: () => void; 
           <b style={{ color: 'var(--holo-text)' }}>Scope:</b>{' '}
           {scopeItems.filter(i => scope[i.key]).map(i => i.label).join(', ') || 'none'}
         </div>
+        <div style={{ fontSize: 12, color: 'var(--holo-text-dim)' }}>
+          <b style={{ color: 'var(--holo-text)' }}>Repositories:</b>{' '}
+          {!preview
+            ? 'test the connection first'
+            : scopedSelected.length === 0
+              ? 'none selected'
+              : scopedSelected.length <= 3
+                ? scopedSelected.join(', ')
+                : `${scopedSelected.length} selected`}
+        </div>
       </div>
     </div>
   )
@@ -2752,6 +2882,8 @@ function CreateMigrationJobModal({ onClose, onCreated }: { onClose: () => void; 
       onFinish={handleFinish}
       finishLabel="Start Migration"
       onValidateStep={validateStep}
+      nextDisabled={(stepIdx) => stepIdx === 0 && !preview && !!form.sourceUrl.trim() && !!form.password.trim()}
+      nextDisabledReason={() => 'Test the connection first'}
       onClose={onClose}
       loading={loading}
       error={error}
