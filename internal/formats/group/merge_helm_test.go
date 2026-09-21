@@ -105,8 +105,7 @@ func TestGroupMerge_HelmTarballSkipsForbiddenMember(t *testing.T) {
 	}))
 	defer denied.Close()
 
-	var releases *httptest.Server
-	releases = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	releases := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/releases/ingress-4.0.0.tgz" {
 			w.Header().Set("Content-Type", "application/x-tar")
 			_, _ = w.Write([]byte("ingress-bytes"))

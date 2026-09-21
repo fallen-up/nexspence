@@ -165,8 +165,7 @@ func TestHelm_Proxy_AbsoluteURLUnderRemote_RoundTrip(t *testing.T) {
 // elsewhere (typically GitHub releases). The index URL is rewritten onto this
 // proxy by basename; the GET fetches the original host and caches the tarball.
 func TestHelm_Proxy_AbsoluteURLForeignHost_RoundTrip(t *testing.T) {
-	var releases *httptest.Server
-	releases = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	releases := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/o/r/releases/download/v1/widget-1.0.0.tgz" {
 			w.Header().Set("Content-Type", "application/x-tar")
 			_, _ = w.Write([]byte("github-chart-bytes"))
