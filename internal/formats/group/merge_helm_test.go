@@ -81,3 +81,101 @@ func TestGroupMerge_HelmEndToEnd(t *testing.T) {
 	require.NotEmpty(t, urls)
 	assert.Equal(t, "http://localhost:8080/repository/helm/widget-1.2.3.tgz", urls[0])
 }
+
+func helmProxyRepo(name, remote string) *domain.Repository {
+	return &domain.Repository{
+		ID: name, Name: name, Format: "helm",
+		Type: domain.TypeProxy, Online: true,
+		ProxyConfig: map[string]any{"remote_url": remote},
+	}
+}
+
+// A member that 403s on a foreign tarball must not hide a later member that
+// actually has the chart. After the pull, the tarball is cached on the member
+// that served it.
+func TestGroupMerge_HelmTarballSkipsForbiddenMember(t *testing.T) {
+	denied := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/index.yaml" {
+			w.Header().Set("Content-Type", "application/yaml")
+			_, _ = w.Write([]byte("apiVersion: v1\nentries: {}\n"))
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("denied"))
+	}))
+	defer denied.Close()
+
+	var releases *httptest.Server
+	releases = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/releases/ingress-4.0.0.tgz" {
+			w.Header().Set("Content-Type", "application/x-tar")
+			_, _ = w.Write([]byte("ingress-bytes"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer releases.Close()
+
+	okRemote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/index.yaml" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/yaml")
+		_, _ = w.Write([]byte("apiVersion: v1\n" +
+			"entries:\n" +
+			"  ingress:\n" +
+			"    - name: ingress\n" +
+			"      version: \"4.0.0\"\n" +
+			"      urls:\n" +
+			"        - " + releases.URL + "/releases/ingress-4.0.0.tgz\n"))
+	}))
+	defer okRemote.Close()
+
+	hosted := testutil.SimpleRepo("helm-hosted", "helm")
+	deniedRepo := helmProxyRepo("helm-remote-bitnami", denied.URL)
+	okRepo := helmProxyRepo("helm-remote-ok", okRemote.URL)
+	g := &domain.Repository{
+		ID: "repo-helm", Name: "helm", Format: "helm",
+		Type: domain.TypeGroup, Online: true,
+		FormatConfig: map[string]any{"member_names": []interface{}{"helm-hosted", "helm-remote-bitnami", "helm-remote-ok"}},
+	}
+
+	repoRepo := testutil.NewRepoRepo(hosted, deniedRepo, okRepo, g)
+	comps := testutil.NewComponentRepo()
+	d := formats.Deps{
+		Repos:      repoRepo,
+		Blobs:      testutil.NewBlobStoreRepo(),
+		Components: comps,
+		Assets:     testutil.NewAssetRepo(),
+		BlobStore:  testutil.NewBlobStore(),
+		BaseURL:    "http://localhost:8080",
+	}
+	helmH := helm.New(d)
+	groupH := group.New(d, map[string]formats.FormatHandler{"helm": helmH})
+
+	r := gin.New()
+	r.Any("/repository/:repoName/*path", func(c *gin.Context) {
+		repo, _ := repoRepo.Get(c.Request.Context(), c.Param("repoName"))
+		if repo != nil && repo.Type == domain.TypeGroup {
+			groupH.ServeHTTP(c)
+			return
+		}
+		helmH.ServeHTTP(c)
+	})
+
+	idx := get(r, "/repository/helm/index.yaml")
+	require.Equal(t, http.StatusOK, idx.Code, idx.Body.String())
+	assert.Contains(t, idx.Body.String(), "ingress")
+	assert.Contains(t, idx.Body.String(), "/repository/helm/ingress-4.0.0.tgz")
+
+	w := get(r, "/repository/helm/ingress-4.0.0.tgz")
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, "ingress-bytes", w.Body.String())
+	assert.Equal(t, "helm-remote-ok", w.Header().Get("X-Nexspence-Source"))
+
+	page, err := comps.List(t.Context(), "helm-remote-ok", 100, 0)
+	require.NoError(t, err)
+	require.Len(t, page.Items, 1, "tarball must be cached on the member that served it")
+	assert.Equal(t, "ingress", page.Items[0].Name)
+}

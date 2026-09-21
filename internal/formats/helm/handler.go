@@ -10,6 +10,7 @@ package helm
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -25,6 +26,7 @@ import (
 	"github.com/nexspence-oss/nexspence/internal/formats"
 	"github.com/nexspence-oss/nexspence/internal/formats/base"
 	"github.com/nexspence-oss/nexspence/internal/formats/repoproxy"
+	"github.com/nexspence-oss/nexspence/internal/repository"
 )
 
 // Handler serves the Helm chart repository protocol.
@@ -57,13 +59,21 @@ func (h *Handler) ServeHTTP(c *gin.Context) {
 		// chart's own coordinates instead of as a component in its own right.
 		filename := strings.TrimSuffix(path.Base(p), ".prov")
 		coords := base.Coords{Name: filename}
+		upstream := ""
 		if strings.HasSuffix(filename, ".tgz") {
 			chartName, version := splitChartFilename(filename)
 			coords = base.Coords{Name: chartName, Version: version}
+			upstream = h.proxyChartUpstream(c, repo, p, chartName, version)
+			if c.Writer.Written() {
+				return
+			}
 		}
 		// Chart tarballs are immutable (index.yaml — the mutable index — is
-		// fetched-and-rewritten above, not cached through here).
-		if err := repoproxy.ServeGET(c, h.deps, repo, p, "", coords, "application/x-tar", 0); err != nil {
+		// fetched-and-rewritten above, not cached through here). A 403 from
+		// the wrong member (Bitnami S3 AccessDenied on a foreign chart) must
+		// not stop group first-non-404 — treat it as a miss.
+		c.Writer = forbidAsNotFound{ResponseWriter: c.Writer}
+		if err := repoproxy.ServeGET(c, h.deps, repo, p, upstream, coords, "application/x-tar", 0); err != nil {
 			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		}
 		return
@@ -238,30 +248,9 @@ func (h *Handler) fetchAndRewriteHelmIndex(c *gin.Context, repo *domain.Reposito
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, remoteBase+"/index.yaml", nil)
+	index, err := fetchHelmIndexDoc(c.Request.Context(), repo, remoteBase)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid upstream URL: " + err.Error()})
-		return
-	}
-	repoproxy.SetUpstreamAuth(req, repo)
-	resp, err := repoproxy.ClientFor(repo).Do(req)
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "upstream fetch failed: " + err.Error()})
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("upstream returned %d", resp.StatusCode)})
-		return
-	}
-
-	var index map[string]any
-	if err := yaml.NewDecoder(resp.Body).Decode(&index); err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid upstream index.yaml: " + err.Error()})
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -338,17 +327,17 @@ func splitChartFilename(filename string) (chartName, version string) {
 //     whole, because the download handler forwards the request path upstream verbatim;
 //  2. an absolute URL under the configured remote — the remote's own path prefix is
 //     stripped and the remainder is treated as case 1;
-//  3. an absolute URL we cannot serve: another host (charts published to GitHub
-//     releases, say), a sibling subtree of the same host, or any URL carrying a query;
+//  3. an absolute URL on another host (GitHub releases) or a sibling subtree of the
+//     same host — rewritten to localBase + basename so helm pull stays on this
+//     proxy, which then fetches the original URL (see originURLForChart) and caches
+//     the tarball. A query string still cannot round-trip and is left for the client.
 //  4. a root-relative path ("/charts/mychart-1.2.3.tgz"), which resolves against the
 //     HOST root and NOT the remote's path prefix — case 2 when it happens to land
 //     inside the proxied subtree, case 3 otherwise.
 //
-// Whatever falls to case 3 is handed back as the absolute upstream URL it resolves to,
-// unchanged when the entry was already absolute. Such an artifact cannot be expressed
-// as a path under this proxy, so the client fetches it directly: that skips the cache
-// and needs egress, but it beats a proxy path that would 404 or, worse, quietly serve
-// a different artifact.
+// A ".." segment is never rewritten: the cleaned path would point at a different
+// upstream file than the raw one, and quietly proxying that is worse than handing
+// the client the original.
 //
 // localBase must end in "/"; remoteBase is the repository's remote_url.
 func rewriteChartURL(rawURL, remoteBase, localBase string) string {
@@ -384,21 +373,171 @@ func rewriteChartURL(rawURL, remoteBase, localBase string) string {
 	if abs.RawQuery != "" || abs.ForceQuery {
 		return unproxyable()
 	}
-	if !sameUpstreamHost(abs, remote) {
+	if strings.Contains(ref.Path, "..") {
 		return unproxyable()
 	}
 
-	// Compare cleaned paths, so a ".." segment cannot slip past the subtree check and
-	// only afterwards collapse into a path pointing at a different upstream file.
 	remotePath := path.Clean("/" + strings.Trim(remote.Path, "/"))
 	absPath := path.Clean("/" + strings.TrimPrefix(abs.Path, "/"))
+	inside := true
 	if remotePath != "/" {
 		if absPath != remotePath && !strings.HasPrefix(absPath, remotePath+"/") {
-			return unproxyable()
+			inside = false
+		} else {
+			absPath = strings.TrimPrefix(absPath, remotePath)
 		}
-		absPath = strings.TrimPrefix(absPath, remotePath)
 	}
-	return localBase + strings.TrimPrefix(absPath, "/")
+	if sameUpstreamHost(abs, remote) && inside {
+		return localBase + strings.TrimPrefix(absPath, "/")
+	}
+	return proxyViaBasename(abs, localBase, unproxyable)
+}
+
+// proxyViaBasename mints a proxy path for an origin URL we can fetch by its
+// absolute form (GitHub releases, a sibling subtree). The tarball is stored
+// under the basename so a later GET can look the origin back up in index.yaml.
+func proxyViaBasename(abs *url.URL, localBase string, unproxyable func() string) string {
+	if abs.Scheme != "http" && abs.Scheme != "https" {
+		return unproxyable()
+	}
+	base := path.Base(abs.Path)
+	if base == "" || base == "." || base == "/" {
+		return unproxyable()
+	}
+	return localBase + base
+}
+
+// forbidAsNotFound maps upstream 403 to 404 so group first-non-404 fan-out
+// continues. Helm remotes such as Bitnami answer AccessDenied on a chart they
+// do not host, which is a miss, not a finished lookup.
+type forbidAsNotFound struct{ gin.ResponseWriter }
+
+func (w forbidAsNotFound) WriteHeader(code int) {
+	if code == http.StatusForbidden {
+		code = http.StatusNotFound
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// proxyChartUpstream returns the absolute origin URL ServeGET should fetch for
+// this chart, or empty to use the request path against remote_url. Writes 404
+// and returns "" when the upstream index is readable but does not list the chart
+// — so a Bitnami proxy is not asked for a Cilium tarball.
+func (h *Handler) proxyChartUpstream(c *gin.Context, repo *domain.Repository, reqPath, chartName, version string) string {
+	if h.deps.Assets != nil {
+		if _, err := h.deps.Assets.GetByPath(c.Request.Context(), repo.Name, reqPath); err == nil {
+			return ""
+		} else if !errors.Is(err, repository.ErrNotFound) {
+			return ""
+		}
+	}
+	origin, listed, indexOK := h.originURLForChart(c.Request.Context(), repo, chartName, version)
+	if indexOK && !listed {
+		c.JSON(http.StatusNotFound, gin.H{"error": "chart not in upstream index"})
+		return ""
+	}
+	if !listed || origin == "" {
+		return ""
+	}
+	if strings.HasSuffix(reqPath, ".prov") {
+		return origin + ".prov"
+	}
+	return origin
+}
+
+func (h *Handler) originURLForChart(ctx context.Context, repo *domain.Repository, chartName, version string) (origin string, listed, indexOK bool) {
+	remoteBase, err := repoproxy.RemoteURL(repo)
+	if err != nil {
+		return "", false, false
+	}
+	index, err := fetchHelmIndexDoc(ctx, repo, remoteBase)
+	if err != nil {
+		return "", false, false
+	}
+	raw := findChartURL(index, chartName, version)
+	if raw == "" {
+		return "", false, true
+	}
+	return resolvedUpstreamChartURL(raw, remoteBase), true, true
+}
+
+func fetchHelmIndexDoc(ctx context.Context, repo *domain.Repository, remoteBase string) (map[string]any, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, remoteBase+"/index.yaml", nil)
+	if err != nil {
+		return nil, fmt.Errorf("invalid upstream URL: %w", err)
+	}
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", "Nexspence/1.0 (proxy)")
+	}
+	repoproxy.SetUpstreamAuth(req, repo)
+	resp, err := repoproxy.ClientFor(repo).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("upstream fetch failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("upstream returned %d", resp.StatusCode)
+	}
+	var index map[string]any
+	if err := yaml.NewDecoder(resp.Body).Decode(&index); err != nil {
+		return nil, fmt.Errorf("invalid upstream index.yaml: %w", err)
+	}
+	return index, nil
+}
+
+func findChartURL(index map[string]any, chartName, version string) string {
+	entries, _ := index["entries"].(map[string]any)
+	for key, raw := range entries {
+		charts, ok := raw.([]any)
+		if !ok {
+			continue
+		}
+		for _, cv := range charts {
+			chart, ok := cv.(map[string]any)
+			if !ok {
+				continue
+			}
+			name := key
+			if n := asString(chart["name"]); n != "" {
+				name = n
+			}
+			if name != chartName || asString(chart["version"]) != version {
+				continue
+			}
+			urls, _ := chart["urls"].([]any)
+			if len(urls) == 0 {
+				return ""
+			}
+			s, _ := urls[0].(string)
+			return s
+		}
+	}
+	return ""
+}
+
+func resolvedUpstreamChartURL(rawURL, remoteBase string) string {
+	remote, err := url.Parse(remoteBase)
+	if err != nil {
+		return ""
+	}
+	ref, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	resolveBase := *remote
+	resolveBase.Path = strings.TrimSuffix(remote.Path, "/") + "/"
+	resolveBase.RawPath = ""
+	abs := resolveBase.ResolveReference(ref)
+	if abs.RawQuery != "" || abs.ForceQuery || strings.Contains(ref.Path, "..") {
+		return ""
+	}
+	if abs.Scheme != "http" && abs.Scheme != "https" {
+		return ""
+	}
+	return abs.String()
 }
 
 // sameUpstreamHost reports whether two URLs address the same upstream host. The

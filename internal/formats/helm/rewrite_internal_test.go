@@ -84,24 +84,25 @@ func TestRewriteChartURL(t *testing.T) {
 			want:       local + "x-1.0.0.tgz",
 		},
 		{
-			name:       "a non-default port is a different upstream",
+			name:       "a non-default port is a different upstream and is proxied by basename",
 			remoteBase: "https://charts.example.com",
 			url:        "https://charts.example.com:8443/x-1.0.0.tgz",
-			want:       "https://charts.example.com:8443/x-1.0.0.tgz",
+			want:       local + "x-1.0.0.tgz",
 		},
 
-		// ── Case 3: unproxyable, handed back absolute ────────────────
+		// ── Case 3: off-host / sibling — proxied by basename (query and .. stay raw)
+
 		{
-			name:       "absolute URL on another host is left alone",
+			name:       "absolute URL on another host is proxied by basename",
 			remoteBase: "https://charts.example.com",
 			url:        "https://github.com/o/r/releases/download/v1/x-1.0.0.tgz",
-			want:       "https://github.com/o/r/releases/download/v1/x-1.0.0.tgz",
+			want:       local + "x-1.0.0.tgz",
 		},
 		{
-			name:       "same host but outside the proxied subtree",
+			name:       "same host but outside the proxied subtree is proxied by basename",
 			remoteBase: "https://charts.example.com/charts-repo",
 			url:        "https://charts.example.com/other-repo/x-1.0.0.tgz",
-			want:       "https://charts.example.com/other-repo/x-1.0.0.tgz",
+			want:       local + "x-1.0.0.tgz",
 		},
 		{
 			// The subtree check must run on the cleaned path. Comparing the raw one
@@ -121,10 +122,10 @@ func TestRewriteChartURL(t *testing.T) {
 			want:       local + "charts/x-1.0.0.tgz",
 		},
 		{
-			name:       "root-relative outside the remote prefix resolves upstream",
+			name:       "root-relative outside the remote prefix is proxied by basename",
 			remoteBase: "https://charts.example.com/base",
 			url:        "/charts/x-1.0.0.tgz",
-			want:       "https://charts.example.com/charts/x-1.0.0.tgz",
+			want:       local + "x-1.0.0.tgz",
 		},
 		{
 			name:       "root-relative with no remote prefix is proxied",

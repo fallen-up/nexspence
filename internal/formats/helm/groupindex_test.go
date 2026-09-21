@@ -44,7 +44,7 @@ entries:
     - name: ingress
       version: 4.0.0
       urls:
-        - https://github.com/example/charts/releases/download/ingress-4.0.0/ingress-4.0.0.tgz
+        - http://localhost:8080/repository/helm-remote/ingress-4.0.0.tgz
   widget:
     - name: widget
       version: 1.2.3
@@ -74,8 +74,8 @@ entries:
 
 	remoteURL, _ := doc.Entries["ingress"][0]["urls"].([]any)
 	require.Len(t, remoteURL, 1)
-	assert.Equal(t, "https://github.com/example/charts/releases/download/ingress-4.0.0/ingress-4.0.0.tgz", remoteURL[0],
-		"off-host GitHub release URL is left for the client")
+	assert.Equal(t, "http://localhost:8080/repository/helm/ingress-4.0.0.tgz", remoteURL[0],
+		"member-minted URL (including GitHub origins rewritten by the proxy) re-rooted at the group")
 }
 
 func TestHelm_MergeGroupIndex_MalformedPartSkipped(t *testing.T) {

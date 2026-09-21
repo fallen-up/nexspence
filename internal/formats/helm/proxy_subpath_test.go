@@ -161,18 +161,55 @@ func TestHelm_Proxy_AbsoluteURLUnderRemote_RoundTrip(t *testing.T) {
 	assert.Equal(t, "absolute-chart-bytes", w.Body.String())
 }
 
-// TestHelm_Proxy_AbsoluteURLForeignHost_LeftAlone covers charts published elsewhere
-// (typically GitHub releases). We cannot express those as a path under this proxy,
-// so the URL must survive untouched and the client fetches it directly.
-func TestHelm_Proxy_AbsoluteURLForeignHost_LeftAlone(t *testing.T) {
-	const foreign = "https://github.com/kubernetes/ingress-nginx/releases/download/helm-chart-4.11.2/ingress-nginx-4.11.2.tgz"
-	upstream := nestedUpstream(t, foreign, "/unused.tgz", "unused")
+// TestHelm_Proxy_AbsoluteURLForeignHost_RoundTrip covers charts published
+// elsewhere (typically GitHub releases). The index URL is rewritten onto this
+// proxy by basename; the GET fetches the original host and caches the tarball.
+func TestHelm_Proxy_AbsoluteURLForeignHost_RoundTrip(t *testing.T) {
+	var releases *httptest.Server
+	releases = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/o/r/releases/download/v1/widget-1.0.0.tgz" {
+			w.Header().Set("Content-Type", "application/x-tar")
+			_, _ = w.Write([]byte("github-chart-bytes"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer releases.Close()
+
+	foreign := releases.URL + "/o/r/releases/download/v1/widget-1.0.0.tgz"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/index.yaml" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/yaml")
+		_, _ = w.Write([]byte("apiVersion: v1\n" +
+			"entries:\n" +
+			"  widget:\n" +
+			"  - name: widget\n" +
+			"    version: \"1.0.0\"\n" +
+			"    urls:\n" +
+			"    - " + foreign + "\n" +
+			"generated: \"2024-01-01T00:00:00Z\"\n"))
+	}))
 	defer upstream.Close()
 
-	r, _ := setupProxy(t, "helm-foreign", upstream.URL)
+	r, comps := setupProxy(t, "helm-foreign", upstream.URL)
 
-	assert.Equal(t, foreign, firstChartURL(t, r, "helm-foreign"),
-		"a chart on another host cannot be proxied and must not be rewritten")
+	chartURL := firstChartURL(t, r, "helm-foreign")
+	assert.Equal(t, testBaseURL+"/repository/helm-foreign/widget-1.0.0.tgz", chartURL)
+
+	req := httptest.NewRequest(http.MethodGet, strings.TrimPrefix(chartURL, testBaseURL), nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	assert.Equal(t, "github-chart-bytes", w.Body.String())
+
+	page, err := comps.List(t.Context(), "helm-foreign", 100, 0)
+	require.NoError(t, err)
+	require.Len(t, page.Items, 1)
+	assert.Equal(t, "widget", page.Items[0].Name)
+	assert.Equal(t, "1.0.0", page.Items[0].Version)
 }
 
 // prefixedUpstream serves a repository rooted at /charts-repo, i.e. a remote whose
@@ -201,6 +238,9 @@ func prefixedUpstream(t *testing.T) *httptest.Server {
 		case "/charts-repo/charts/inside-1.0.0.tgz":
 			w.Header().Set("Content-Type", "application/x-tar")
 			_, _ = w.Write([]byte("inside-chart-bytes"))
+		case "/other-repo/outside-1.0.0.tgz":
+			w.Header().Set("Content-Type", "application/x-tar")
+			_, _ = w.Write([]byte("outside-chart-bytes"))
 		default:
 			http.NotFound(w, r)
 		}
@@ -210,7 +250,7 @@ func prefixedUpstream(t *testing.T) *httptest.Server {
 
 // TestHelm_Proxy_RemoteWithPathPrefix covers a remote_url that has its own path
 // prefix: an entry inside that subtree is proxied with the prefix stripped, and one
-// outside it is handed to the client untouched.
+// outside it is still pulled through this proxy (basename path, origin URL fetch).
 func TestHelm_Proxy_RemoteWithPathPrefix(t *testing.T) {
 	upstream := prefixedUpstream(t)
 	defer upstream.Close()
@@ -232,15 +272,21 @@ func TestHelm_Proxy_RemoteWithPathPrefix(t *testing.T) {
 	inside := index.Entries["inside"][0].URLs[0]
 	assert.Equal(t, testBaseURL+"/repository/helm-prefix/charts/inside-1.0.0.tgz", inside,
 		"the remote's own path prefix must be stripped, the rest kept")
-	assert.Equal(t, upstream.URL+"/other-repo/outside-1.0.0.tgz",
-		index.Entries["outside"][0].URLs[0],
-		"a URL outside the proxied subtree is not ours to rewrite")
+	outside := index.Entries["outside"][0].URLs[0]
+	assert.Equal(t, testBaseURL+"/repository/helm-prefix/outside-1.0.0.tgz", outside,
+		"a URL outside the proxied subtree is still fetched through this proxy")
 
 	req = httptest.NewRequest(http.MethodGet, strings.TrimPrefix(inside, testBaseURL), nil)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	assert.Equal(t, "inside-chart-bytes", w.Body.String())
+
+	req = httptest.NewRequest(http.MethodGet, strings.TrimPrefix(outside, testBaseURL), nil)
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	assert.Equal(t, "outside-chart-bytes", w.Body.String())
 }
 
 // TestHelm_Proxy_ProvenanceFile_SharesChartCoords verifies the ".prov" signature
@@ -322,4 +368,46 @@ func TestHelm_Proxy_NestedChart_CachedCoords(t *testing.T) {
 	require.Len(t, page.Items, 1)
 	assert.Equal(t, "ingress-nginx", page.Items[0].Name)
 	assert.Equal(t, "4.11.2", page.Items[0].Version)
+}
+
+// TestHelm_Proxy_UnknownChartInIndexIsNotFound: a readable index that does not
+// list this chart must 404 without asking upstream for the tarball (Bitnami's
+// S3 would 403, which used to stop group fan-out).
+func TestHelm_Proxy_UnknownChartInIndexIsNotFound(t *testing.T) {
+	hitTgz := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/index.yaml":
+			w.Header().Set("Content-Type", "application/yaml")
+			_, _ = w.Write([]byte("apiVersion: v1\nentries:\n  redis:\n    - name: redis\n      version: \"1.0.0\"\n      urls:\n        - redis-1.0.0.tgz\n"))
+		default:
+			hitTgz = true
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`<Error><Code>AccessDenied</Code></Error>`))
+		}
+	}))
+	defer upstream.Close()
+
+	r, _ := setupProxy(t, "helm-bitnami", upstream.URL)
+	req := httptest.NewRequest(http.MethodGet, "/repository/helm-bitnami/cilium-1.16.0.tgz", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+	assert.False(t, hitTgz, "must not fetch a chart the index does not list")
+}
+
+// TestHelm_Proxy_UpstreamForbiddenBecomesNotFound: when the index cannot be
+// read, a 403 from the tarball host is still a miss for group fan-out.
+func TestHelm_Proxy_UpstreamForbiddenBecomesNotFound(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`<Error><Code>AccessDenied</Code></Error>`))
+	}))
+	defer upstream.Close()
+
+	r, _ := setupProxy(t, "helm-denied", upstream.URL)
+	req := httptest.NewRequest(http.MethodGet, "/repository/helm-denied/cilium-1.16.0.tgz", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
 }

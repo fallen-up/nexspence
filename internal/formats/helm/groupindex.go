@@ -5,8 +5,9 @@ package helm
 // first-non-404 fan-out hid every proxy behind the first hosted repo. Merging
 // unions chart entries across members; first member wins per name+version.
 // Download URLs minted at /repository/<member>/ are re-rooted at the group
-// so helm pull stays on the group URL. Off-host URLs (GitHub releases) are
-// left alone — rewriteChartURL already classified them as unproxyable.
+// so helm pull stays on the group URL. Off-host GitHub release URLs are
+// rewritten onto the member by the proxy (then re-rooted here) so the tarball
+// is fetched through Nexspence and cached.
 
 import (
 	"fmt"
