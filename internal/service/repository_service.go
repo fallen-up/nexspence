@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
@@ -298,14 +297,6 @@ func mergeProxyConfig(stored, updates map[string]any) map[string]any {
 	return merged
 }
 
-// dockerPathComponent is the distribution reference grammar for one path
-// component. Docker-family clients parse image references with it, so a
-// docker/oci repository whose name fails it exists but can never be pushed to
-// or pulled from — `docker tag host/<name>/img` is not even parseable. (#262
-// was found via a repository named "docker test", created without complaint
-// and then silently unusable.)
-var dockerPathComponent = regexp.MustCompile(`^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*$`)
-
 // reservedV2Names are the static routes registered under /v2/ (see
 // internal/api/router.go). Gin matches a static segment before the
 // /v2/:repoName parameter, so a repository named after one is created
@@ -326,7 +317,7 @@ func validateNameForFormat(name string, format domain.RepoFormat) error {
 	if !format.IsOCIRegistry() {
 		return nil
 	}
-	if !dockerPathComponent.MatchString(name) {
+	if !domain.IsDockerPathComponent(name) {
 		return fmt.Errorf(
 			"%w: %q cannot be addressed by docker clients — use lowercase letters and digits, "+
 				"joined by '.', '_' or '-' (e.g. \"docker-test\")",

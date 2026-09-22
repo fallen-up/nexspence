@@ -268,3 +268,25 @@ func TestSubdomainRewriter_AliasTargetMayContainDots(t *testing.T) {
 	rw.ServeHTTP(httptest.NewRecorder(), req)
 	assert.Equal(t, "/v2/registry-1.docker.io/library/alpine/manifests/latest", gotPath)
 }
+
+// The alias target is checked with the grammar repository creation enforces, so
+// every name a docker repository can carry is a usable alias target — including
+// the underscore and double-dash forms.
+func TestSubdomainRewriter_AliasTargetMatchesRepositoryGrammar(t *testing.T) {
+	var gotPath string
+	h := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { gotPath = r.URL.Path })
+	rw := api.NewSubdomainRewriter(h, "nexspence.example.com", map[string]string{
+		"underscore.example.org": "team.registry_2",
+		"dashes.example.org":     "a--b",
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/alpine/manifests/latest", nil)
+	req.Host = "underscore.example.org"
+	rw.ServeHTTP(httptest.NewRecorder(), req)
+	assert.Equal(t, "/v2/team.registry_2/alpine/manifests/latest", gotPath)
+
+	req = httptest.NewRequest(http.MethodGet, "/v2/alpine/manifests/latest", nil)
+	req.Host = "dashes.example.org"
+	rw.ServeHTTP(httptest.NewRecorder(), req)
+	assert.Equal(t, "/v2/a--b/alpine/manifests/latest", gotPath)
+}

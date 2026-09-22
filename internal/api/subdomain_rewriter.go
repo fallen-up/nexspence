@@ -3,6 +3,8 @@ package api
 import (
 	"net/http"
 	"strings"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
 )
 
 // SubdomainRewriter is an http.Handler wrapper that rewrites Docker /v2/* paths
@@ -28,15 +30,15 @@ type SubdomainRewriter struct {
 // baseDomain must NOT have a leading dot (e.g. "nexspence.example.com").
 // aliases maps full client hostnames to repository names; alias hostnames do
 // not have to sit under baseDomain, and an alias for "<sub>.<baseDomain>"
-// overrides the implicit "<sub>" repository. Alias targets that are not valid
-// repository name labels are ignored — the value is spliced into a URL path,
+// overrides the implicit "<sub>" repository. Alias targets that no docker
+// repository could be named are ignored — the value is spliced into a URL path,
 // and a config typo must not become a path injection.
 func NewSubdomainRewriter(next http.Handler, baseDomain string, aliases map[string]string) http.Handler {
 	m := make(map[string]string, len(aliases))
 	for host, repo := range aliases {
 		host = strings.ToLower(strings.TrimSpace(host))
 		repo = strings.TrimSpace(repo)
-		if host == "" || !isRepositoryName(repo) {
+		if host == "" || !domain.IsDockerPathComponent(repo) {
 			continue
 		}
 		m[host] = repo
@@ -111,30 +113,4 @@ func isRepoNameLabel(s string) bool {
 		}
 	}
 	return true
-}
-
-// isRepositoryName reports whether s is safe to splice into /v2/<name>/... as
-// a Nexspence repository name. Dots are allowed (quay.io, ghcr.io,
-// registry-1.docker.io). Slashes and ".." are not — those would change the
-// path shape, which is how an alias typo becomes a rewrite into another route.
-func isRepositoryName(s string) bool {
-	if s == "" || strings.ContainsAny(s, `/\:`) || strings.Contains(s, "..") {
-		return false
-	}
-	prevSep := true
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
-			prevSep = false
-		case c == '-' || c == '.':
-			if prevSep {
-				return false
-			}
-			prevSep = true
-		default:
-			return false
-		}
-	}
-	return !prevSep
 }

@@ -3,6 +3,7 @@
 package domain
 
 import (
+	"regexp"
 	"time"
 )
 
@@ -75,6 +76,22 @@ var AllFormats = []RepoFormat{
 // never in protocol behavior, so every protocol-level check uses this one method.
 func (f RepoFormat) IsOCIRegistry() bool {
 	return f == FormatDocker || f == FormatOCI
+}
+
+// dockerPathComponent is the distribution reference grammar for one path
+// component. Docker-family clients parse image references with it, so a
+// docker/oci repository whose name fails it exists but can never be pushed to
+// or pulled from — `docker tag host/<name>/img` is not even parseable. (#262
+// was found via a repository named "docker test", created without complaint
+// and then silently unusable.)
+var dockerPathComponent = regexp.MustCompile(`^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*$`)
+
+// IsDockerPathComponent reports whether name is one path component a
+// docker-family client can address. It is also what makes a name safe to
+// splice into a URL path: the grammar has no room for a slash, a "..", an
+// empty component or a leading/trailing separator.
+func IsDockerPathComponent(name string) bool {
+	return dockerPathComponent.MatchString(name)
 }
 
 // Repository is a hosted, proxy, or group artifact repository of a given format.
