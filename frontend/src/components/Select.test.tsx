@@ -39,25 +39,34 @@ describe('Select', () => {
     expect(screen.queryByText('Alpha')).not.toBeInTheDocument()
   })
 
-  it('toggles closed on a second trigger click', async () => {
+  it('closes when the open chevron is clicked', async () => {
     render(<Select options={opts} value="" onChange={() => {}} />)
-    const trigger = screen.getByRole('button')
-    await userEvent.click(trigger)
+    await userEvent.click(screen.getByRole('button'))
     expect(screen.getByText('Alpha')).toBeInTheDocument()
-    await userEvent.click(trigger)
+    // The trigger is the combobox now; the chevron sits next to it.
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }))
     expect(screen.queryByText('Alpha')).not.toBeInTheDocument()
   })
 
-  it('filters options when searchable and shows "No matches"', async () => {
-    render(<Select options={opts} value="" onChange={() => {}} searchable />)
+  it('filters the open list as you type in the trigger', async () => {
+    render(<Select options={opts} value="" onChange={() => {}} />)
     await userEvent.click(screen.getByRole('button'))
-    const filter = screen.getByPlaceholderText('Filter…')
-    await userEvent.type(filter, 'alp')
+    const box = screen.getByRole('combobox')
+    await userEvent.type(box, 'alp')
     expect(screen.getByText('Alpha')).toBeInTheDocument()
     expect(screen.queryByText('Beta')).not.toBeInTheDocument()
-    await userEvent.clear(filter)
-    await userEvent.type(filter, 'zzz')
+    await userEvent.clear(box)
+    await userEvent.type(box, 'zzz')
     expect(screen.getByText('No matches')).toBeInTheDocument()
+  })
+
+  it('Enter picks the first match after a filter', async () => {
+    const onChange = vi.fn()
+    render(<Select options={opts} value="" onChange={onChange} />)
+    await userEvent.click(screen.getByRole('button'))
+    await userEvent.type(screen.getByRole('combobox'), 'bet{Enter}')
+    expect(onChange).toHaveBeenCalledWith('b')
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
   })
 
   it('shows "No options" when given an empty list', async () => {
@@ -74,7 +83,7 @@ describe('Select', () => {
     expect(screen.getByTestId('badge')).toBeInTheDocument()
     expect(screen.getByTestId('tag')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button'))
-    // Now both trigger and list render badge/tag.
+    // Open trigger is the filter; badges stay on the list row.
     expect(screen.getAllByTestId('badge').length).toBeGreaterThan(0)
   })
 

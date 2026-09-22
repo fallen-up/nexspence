@@ -16,33 +16,48 @@ interface SelectProps {
   onChange: (value: string) => void
   placeholder?: string
   disabled?: boolean
+  // Unused: the open trigger is always the filter. Kept so callers still type-check.
   searchable?: boolean
   style?: CSSProperties
+}
+
+function matches(opt: SelectOption, q: string): boolean {
+  const needle = q.toLowerCase()
+  return opt.label.toLowerCase().includes(needle) || opt.value.toLowerCase().includes(needle)
 }
 
 export function Select({
   options, value, onChange,
   placeholder = '— Select —',
-  disabled, searchable, style,
+  disabled, style,
 }: SelectProps) {
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [dropPos, setDropPos] = useState<{ top: number; left: number; width: number } | null>(null)
-  const triggerRef = useRef<HTMLButtonElement>(null)
+  const triggerRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
   const dropdownRef = useRef<HTMLDivElement>(null)
   const selected = options.find(o => o.value === value)
 
+  function placeMenu() {
+    if (!triggerRef.current) return
+    const r = triggerRef.current.getBoundingClientRect()
+    setDropPos({ top: r.bottom + 4, left: r.left, width: r.width })
+  }
+
   function openMenu() {
-    if (disabled) return
-    if (!open && triggerRef.current) {
-      const r = triggerRef.current.getBoundingClientRect()
-      setDropPos({ top: r.bottom + 4, left: r.left, width: r.width })
-    }
-    setOpen(v => !v)
+    if (disabled || open) return
+    placeMenu()
+    setOpen(true)
+  }
+
+  function closeMenu() {
+    setOpen(false)
   }
 
   useEffect(() => {
     if (!open) { setSearch(''); return }
+    inputRef.current?.focus()
     function onScroll(e: Event) {
       if (dropdownRef.current?.contains(e.target as Node)) return
       setOpen(false)
@@ -68,9 +83,12 @@ export function Select({
     }
   }, [open])
 
-  const visible = searchable && search.trim()
-    ? options.filter(o => o.label.toLowerCase().includes(search.toLowerCase()))
-    : options
+  const visible = search.trim() ? options.filter(o => matches(o, search.trim())) : options
+
+  function pick(v: string) {
+    onChange(v)
+    closeMenu()
+  }
 
   const triggerStyle: CSSProperties = {
     display: 'flex', alignItems: 'center', gap: 8,
@@ -79,11 +97,12 @@ export function Select({
     border: `1px solid ${open ? 'rgba(124,92,255,0.5)' : 'rgba(124,92,255,0.35)'}`,
     borderRadius: 999,
     boxShadow: open ? '0 0 0 3px rgba(124,92,255,0.12)' : 'none',
-    color: selected ? 'var(--holo-text)' : 'var(--holo-text-faint)',
-    cursor: disabled ? 'not-allowed' : 'pointer',
+    color: selected && !open ? 'var(--holo-text)' : 'var(--holo-text-faint)',
+    cursor: disabled ? 'not-allowed' : open ? 'text' : 'pointer',
     opacity: disabled ? 0.5 : 1,
     textAlign: 'left' as const,
     fontSize: 13,
+    boxSizing: 'border-box' as const,
     ...style,
   }
 
@@ -91,6 +110,7 @@ export function Select({
     <div
       ref={dropdownRef}
       className="holo-card"
+      role="listbox"
       style={{
         position: 'fixed',
         top: dropPos.top,
@@ -105,21 +125,9 @@ export function Select({
         overflowY: 'auto' as const,
       }}
     >
-      {searchable && (
-        <div style={{ padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.06)', marginBottom: 2 }}>
-          <input
-            autoFocus
-            placeholder="Filter…"
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-            className="holo-input"
-            style={{ width: '100%', boxSizing: 'border-box' as const, fontSize: 12, padding: '5px 10px' }}
-          />
-        </div>
-      )}
       {visible.length === 0 && (
         <div style={{ padding: '8px 12px', fontSize: 12, color: 'var(--holo-text-faint)' }}>
-          {searchable && search ? 'No matches' : 'No options'}
+          {search ? 'No matches' : 'No options'}
         </div>
       )}
       {visible.map(opt => {
@@ -127,7 +135,9 @@ export function Select({
         return (
           <div
             key={opt.value}
-            onClick={() => { onChange(opt.value); setOpen(false) }}
+            role="option"
+            aria-selected={isSel}
+            onClick={() => pick(opt.value)}
             style={{
               display: 'flex', alignItems: 'center', gap: 8,
               padding: '7px 12px',
@@ -160,15 +170,52 @@ export function Select({
   ) : null
 
   return (
-    <div style={{ position: 'relative' }}>
-      <button type="button" ref={triggerRef} disabled={disabled} onClick={openMenu} style={triggerStyle}>
-        <span style={{ flex: 1 }}>
-          {selected ? selected.label : placeholder}
-        </span>
-        {selected?.badge}
-        {selected?.tag}
-        <ChevronDown size={14} style={{ color: 'var(--holo-text-faint)', flexShrink: 0, transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }} />
-      </button>
+    <div ref={triggerRef} style={{ position: 'relative' }}>
+      {open ? (
+        <div style={triggerStyle}>
+          <input
+            ref={inputRef}
+            role="combobox"
+            aria-expanded
+            aria-autocomplete="list"
+            aria-label={placeholder}
+            value={search}
+            placeholder={selected ? selected.label : placeholder}
+            onChange={e => setSearch(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && visible.length > 0 && search.trim()) {
+                e.preventDefault()
+                pick(visible[0].value)
+              }
+            }}
+            style={{
+              flex: 1, minWidth: 0, border: 'none', outline: 'none',
+              background: 'transparent', padding: 0, fontSize: 13,
+              color: 'var(--holo-text)',
+            }}
+          />
+          <button
+            type="button"
+            aria-label="Close"
+            onClick={closeMenu}
+            style={{
+              display: 'flex', alignItems: 'center', padding: 0, border: 'none',
+              background: 'transparent', cursor: 'pointer', color: 'var(--holo-text-faint)',
+            }}
+          >
+            <ChevronDown size={14} style={{ transform: 'rotate(180deg)', transition: 'transform 0.2s' }} />
+          </button>
+        </div>
+      ) : (
+        <button type="button" disabled={disabled} onClick={openMenu} style={triggerStyle}>
+          <span style={{ flex: 1 }}>
+            {selected ? selected.label : placeholder}
+          </span>
+          {selected?.badge}
+          {selected?.tag}
+          <ChevronDown size={14} style={{ color: 'var(--holo-text-faint)', flexShrink: 0, transition: 'transform 0.2s' }} />
+        </button>
+      )}
       {dropdown}
     </div>
   )
