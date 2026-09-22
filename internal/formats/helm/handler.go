@@ -30,10 +30,15 @@ import (
 )
 
 // Handler serves the Helm chart repository protocol.
-type Handler struct{ deps formats.Deps }
+type Handler struct {
+	deps    formats.Deps
+	indexes *chartIndexCache
+}
 
 // New creates a Helm format Handler with the given dependencies.
-func New(deps formats.Deps) *Handler { return &Handler{deps: deps} }
+func New(deps formats.Deps) *Handler {
+	return &Handler{deps: deps, indexes: newChartIndexCache()}
+}
 
 // Name returns the format identifier.
 func (h *Handler) Name() string { return "helm" }
@@ -71,8 +76,12 @@ func (h *Handler) ServeHTTP(c *gin.Context) {
 		// Chart tarballs are immutable (index.yaml — the mutable index — is
 		// fetched-and-rewritten above, not cached through here). A 403 from
 		// the wrong member (Bitnami S3 AccessDenied on a foreign chart) must
-		// not stop group first-non-404 — treat it as a miss.
-		c.Writer = forbidAsNotFound{ResponseWriter: c.Writer}
+		// not stop group first-non-404 — treat it as a miss while fanning out.
+		// On a direct request the 403 is the answer: masking it would report a
+		// wrong upstream credential as "no such chart".
+		if c.GetBool(formats.GroupMemberKey) {
+			c.Writer = forbidAsNotFound{ResponseWriter: c.Writer}
+		}
 		if err := repoproxy.ServeGET(c, h.deps, repo, p, upstream, coords, "application/x-tar", 0); err != nil {
 			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		}
@@ -257,7 +266,7 @@ func (h *Handler) fetchAndRewriteHelmIndex(c *gin.Context, repo *domain.Reposito
 	// Rewrite each chart's download URLs to point through this proxy.
 	localBase := strings.TrimRight(h.deps.BaseURL, "/") + "/repository/" + repo.Name + "/"
 	if entries, ok := index["entries"].(map[string]any); ok {
-		for _, v := range entries {
+		for key, v := range entries {
 			charts, ok := v.([]any)
 			if !ok {
 				continue
@@ -270,7 +279,7 @@ func (h *Handler) fetchAndRewriteHelmIndex(c *gin.Context, repo *domain.Reposito
 				if urls, ok := chart["urls"].([]any); ok {
 					for i, u := range urls {
 						if us, ok := u.(string); ok {
-							urls[i] = rewriteChartURL(us, remoteBase, localBase)
+							urls[i] = rewriteChartURL(us, remoteBase, localBase, canonicalChartFile(chart, key))
 						}
 					}
 					chart["urls"] = urls
@@ -328,7 +337,7 @@ func splitChartFilename(filename string) (chartName, version string) {
 //  2. an absolute URL under the configured remote — the remote's own path prefix is
 //     stripped and the remainder is treated as case 1;
 //  3. an absolute URL on another host (GitHub releases) or a sibling subtree of the
-//     same host — rewritten to localBase + basename so helm pull stays on this
+//     same host — rewritten to localBase + canonicalFile so helm pull stays on this
 //     proxy, which then fetches the original URL (see originURLForChart) and caches
 //     the tarball. A query string still cannot round-trip and is left for the client.
 //  4. a root-relative path ("/charts/mychart-1.2.3.tgz"), which resolves against the
@@ -340,7 +349,9 @@ func splitChartFilename(filename string) (chartName, version string) {
 // the client the original.
 //
 // localBase must end in "/"; remoteBase is the repository's remote_url.
-func rewriteChartURL(rawURL, remoteBase, localBase string) string {
+// canonicalFile is the "<name>-<version>.tgz" of the index entry this URL belongs
+// to, or empty when the entry does not name both; see proxyViaBasename.
+func rewriteChartURL(rawURL, remoteBase, localBase, canonicalFile string) string {
 	remote, err := url.Parse(remoteBase)
 	if err != nil {
 		return rawURL
@@ -390,21 +401,44 @@ func rewriteChartURL(rawURL, remoteBase, localBase string) string {
 	if sameUpstreamHost(abs, remote) && inside {
 		return localBase + strings.TrimPrefix(absPath, "/")
 	}
-	return proxyViaBasename(abs, localBase, unproxyable)
+	return proxyViaBasename(abs, localBase, canonicalFile, unproxyable)
 }
 
 // proxyViaBasename mints a proxy path for an origin URL we can fetch by its
-// absolute form (GitHub releases, a sibling subtree). The tarball is stored
-// under the basename so a later GET can look the origin back up in index.yaml.
-func proxyViaBasename(abs *url.URL, localBase string, unproxyable func() string) string {
+// absolute form (GitHub releases, a sibling subtree). The download handler
+// recovers the origin by splitting the filename back into chart coordinates and
+// looking them up in index.yaml, so the minted name is the entry's own
+// "<name>-<version>.tgz" — an origin named anything else ("widget.tgz",
+// "widget-v1.0.0.tgz" at version "1.0.0") would not survive that round trip and
+// would answer 404. Only an entry that fails to name its chart falls back to the
+// origin's basename.
+func proxyViaBasename(abs *url.URL, localBase, canonicalFile string, unproxyable func() string) string {
 	if abs.Scheme != "http" && abs.Scheme != "https" {
 		return unproxyable()
 	}
-	base := path.Base(abs.Path)
-	if base == "" || base == "." || base == "/" {
+	file := canonicalFile
+	if file == "" {
+		file = path.Base(abs.Path)
+	}
+	if file == "" || file == "." || file == "/" {
 		return unproxyable()
 	}
-	return localBase + base
+	return localBase + file
+}
+
+// canonicalChartFile is the "<name>-<version>.tgz" of one index entry, or empty
+// when the entry names neither a chart (the entries key is the fallback) nor a
+// version.
+func canonicalChartFile(chart map[string]any, entryKey string) string {
+	name := asString(chart["name"])
+	if name == "" {
+		name = entryKey
+	}
+	version := asString(chart["version"])
+	if name == "" || version == "" {
+		return ""
+	}
+	return name + "-" + version + ".tgz"
 }
 
 // forbidAsNotFound maps upstream 403 to 404 so group first-non-404 fan-out
@@ -450,11 +484,11 @@ func (h *Handler) originURLForChart(ctx context.Context, repo *domain.Repository
 	if err != nil {
 		return "", false, false
 	}
-	index, err := fetchHelmIndexDoc(ctx, repo, remoteBase)
+	urls, err := h.chartURLs(ctx, repo, remoteBase)
 	if err != nil {
 		return "", false, false
 	}
-	raw := findChartURL(index, chartName, version)
+	raw := urls[chartName+"@"+version]
 	if raw == "" {
 		return "", false, true
 	}
@@ -486,36 +520,6 @@ func fetchHelmIndexDoc(ctx context.Context, repo *domain.Repository, remoteBase 
 		return nil, fmt.Errorf("invalid upstream index.yaml: %w", err)
 	}
 	return index, nil
-}
-
-func findChartURL(index map[string]any, chartName, version string) string {
-	entries, _ := index["entries"].(map[string]any)
-	for key, raw := range entries {
-		charts, ok := raw.([]any)
-		if !ok {
-			continue
-		}
-		for _, cv := range charts {
-			chart, ok := cv.(map[string]any)
-			if !ok {
-				continue
-			}
-			name := key
-			if n := asString(chart["name"]); n != "" {
-				name = n
-			}
-			if name != chartName || asString(chart["version"]) != version {
-				continue
-			}
-			urls, _ := chart["urls"].([]any)
-			if len(urls) == 0 {
-				return ""
-			}
-			s, _ := urls[0].(string)
-			return s
-		}
-	}
-	return ""
 }
 
 func resolvedUpstreamChartURL(rawURL, remoteBase string) string {

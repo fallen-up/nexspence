@@ -178,3 +178,74 @@ func TestGroupMerge_HelmTarballSkipsForbiddenMember(t *testing.T) {
 	require.Len(t, page.Items, 1, "tarball must be cached on the member that served it")
 	assert.Equal(t, "ingress", page.Items[0].Name)
 }
+
+// A member whose index.yaml cannot be read either — a private remote answering
+// 403 to everything — is the case where the member cannot tell "not mine" from
+// "not allowed". During fan-out that 403 still has to read as a miss, or the
+// group stops at the first misconfigured member and the chart disappears.
+func TestGroupMerge_HelmTarballSkipsUnreadableMember(t *testing.T) {
+	denied := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("denied"))
+	}))
+	defer denied.Close()
+
+	okRemote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/index.yaml":
+			w.Header().Set("Content-Type", "application/yaml")
+			_, _ = w.Write([]byte("apiVersion: v1\n" +
+				"entries:\n" +
+				"  ingress:\n" +
+				"    - name: ingress\n" +
+				"      version: \"4.0.0\"\n" +
+				"      urls:\n" +
+				"        - ingress-4.0.0.tgz\n"))
+		case "/ingress-4.0.0.tgz":
+			w.Header().Set("Content-Type", "application/x-tar")
+			_, _ = w.Write([]byte("ingress-bytes"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer okRemote.Close()
+
+	deniedRepo := helmProxyRepo("helm-remote-private", denied.URL)
+	okRepo := helmProxyRepo("helm-remote-ok", okRemote.URL)
+	g := &domain.Repository{
+		ID: "repo-helm", Name: "helm", Format: "helm",
+		Type: domain.TypeGroup, Online: true,
+		FormatConfig: map[string]any{"member_names": []interface{}{"helm-remote-private", "helm-remote-ok"}},
+	}
+
+	repoRepo := testutil.NewRepoRepo(deniedRepo, okRepo, g)
+	d := formats.Deps{
+		Repos:      repoRepo,
+		Blobs:      testutil.NewBlobStoreRepo(),
+		Components: testutil.NewComponentRepo(),
+		Assets:     testutil.NewAssetRepo(),
+		BlobStore:  testutil.NewBlobStore(),
+		BaseURL:    "http://localhost:8080",
+	}
+	helmH := helm.New(d)
+	groupH := group.New(d, map[string]formats.FormatHandler{"helm": helmH})
+
+	r := gin.New()
+	r.Any("/repository/:repoName/*path", func(c *gin.Context) {
+		repo, _ := repoRepo.Get(c.Request.Context(), c.Param("repoName"))
+		if repo != nil && repo.Type == domain.TypeGroup {
+			groupH.ServeHTTP(c)
+			return
+		}
+		helmH.ServeHTTP(c)
+	})
+
+	w := get(r, "/repository/helm/ingress-4.0.0.tgz")
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, "ingress-bytes", w.Body.String())
+	assert.Equal(t, "helm-remote-ok", w.Header().Get("X-Nexspence-Source"))
+
+	// Addressed directly, the same member reports the 403 it got.
+	direct := get(r, "/repository/helm-remote-private/ingress-4.0.0.tgz")
+	assert.Equal(t, http.StatusForbidden, direct.Code, direct.Body.String())
+}

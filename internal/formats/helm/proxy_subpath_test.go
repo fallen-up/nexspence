@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -23,6 +24,14 @@ const testBaseURL = "http://localhost:8080"
 // engine plus the in-memory component repo so tests can assert what got cached.
 func setupProxy(t *testing.T, repoName, remoteURL string) (*gin.Engine, *testutil.ComponentRepo) {
 	t.Helper()
+	return setupProxyWithIndexTTL(t, repoName, remoteURL, 5*time.Minute)
+}
+
+// setupProxyWithIndexTTL is setupProxy with helm.index_cache_ttl spelled out; 0
+// makes every chart lookup fetch the upstream index.
+func setupProxyWithIndexTTL(t *testing.T, repoName, remoteURL string, indexTTL time.Duration,
+) (*gin.Engine, *testutil.ComponentRepo) {
+	t.Helper()
 	comps := testutil.NewComponentRepo()
 	repo := &domain.Repository{
 		ID: repoName, Name: repoName, Format: "helm",
@@ -36,6 +45,8 @@ func setupProxy(t *testing.T, repoName, remoteURL string) (*gin.Engine, *testuti
 		Assets:     testutil.NewAssetRepo(),
 		BlobStore:  testutil.NewBlobStore(),
 		BaseURL:    testBaseURL,
+
+		HelmIndexCacheTTL: indexTTL,
 	}
 	h := helm.New(d)
 	r := gin.New()
@@ -209,6 +220,122 @@ func TestHelm_Proxy_AbsoluteURLForeignHost_RoundTrip(t *testing.T) {
 	require.Len(t, page.Items, 1)
 	assert.Equal(t, "widget", page.Items[0].Name)
 	assert.Equal(t, "1.0.0", page.Items[0].Version)
+}
+
+// TestHelm_Proxy_ForeignHostNonCanonicalFilename_RoundTrip: an off-host origin is
+// free to be named anything ("widget.tgz", "widget-v1.0.0.tgz" for version
+// "1.0.0"). Since the GET recovers the origin by splitting the filename back into
+// chart coordinates, the index rewrite mints the entry's own name — proxying the
+// origin's basename instead made the lookup miss and answered 404.
+func TestHelm_Proxy_ForeignHostNonCanonicalFilename_RoundTrip(t *testing.T) {
+	for _, tc := range []struct{ name, originFile string }{
+		{"no version in the file name", "widget.tgz"},
+		{"v-prefixed version in the file name", "widget-v1.0.0.tgz"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			releases := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/o/r/releases/download/v1.0.0/"+tc.originFile {
+					w.Header().Set("Content-Type", "application/x-tar")
+					_, _ = w.Write([]byte("github-chart-bytes"))
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer releases.Close()
+
+			foreign := releases.URL + "/o/r/releases/download/v1.0.0/" + tc.originFile
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/index.yaml" {
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/yaml")
+				_, _ = w.Write([]byte("apiVersion: v1\n" +
+					"entries:\n" +
+					"  widget:\n" +
+					"  - name: widget\n" +
+					"    version: \"1.0.0\"\n" +
+					"    urls:\n" +
+					"    - " + foreign + "\n"))
+			}))
+			defer upstream.Close()
+
+			r, comps := setupProxy(t, "helm-noncanon", upstream.URL)
+
+			chartURL := firstChartURL(t, r, "helm-noncanon")
+			assert.Equal(t, testBaseURL+"/repository/helm-noncanon/widget-1.0.0.tgz", chartURL)
+
+			req := httptest.NewRequest(http.MethodGet, strings.TrimPrefix(chartURL, testBaseURL), nil)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+			assert.Equal(t, "github-chart-bytes", w.Body.String())
+
+			page, err := comps.List(t.Context(), "helm-noncanon", 100, 0)
+			require.NoError(t, err)
+			require.Len(t, page.Items, 1)
+			assert.Equal(t, "widget", page.Items[0].Name)
+			assert.Equal(t, "1.0.0", page.Items[0].Version)
+		})
+	}
+}
+
+// TestHelm_Proxy_IndexCacheTTL: the origin lookup runs on every uncached tarball
+// GET, so without a cache the first pull through a group of N proxy members costs
+// N index downloads — Bitnami's index is tens of megabytes. helm.index_cache_ttl
+// is how long a fetched index answers those lookups, and 0 turns it off.
+func TestHelm_Proxy_IndexCacheTTL(t *testing.T) {
+	pulls := []string{"widget-1.0.0.tgz", "gadget-2.0.0.tgz", "cilium-1.16.0.tgz"}
+
+	for _, tc := range []struct {
+		name     string
+		ttl      time.Duration
+		wantHits int
+		hitsWhy  string
+		repoName string
+	}{
+		{"a live TTL reuses the fetched index", 5 * time.Minute, 1,
+			"the index must be reused across chart lookups", "helm-cache"},
+		{"zero TTL fetches per lookup", 0, len(pulls),
+			"caching off means one index fetch per chart lookup", "helm-nocache"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var indexHits int
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/index.yaml":
+					indexHits++
+					w.Header().Set("Content-Type", "application/yaml")
+					_, _ = w.Write([]byte("apiVersion: v1\n" +
+						"entries:\n" +
+						"  widget:\n" +
+						"  - name: widget\n" +
+						"    version: \"1.0.0\"\n" +
+						"    urls:\n" +
+						"    - widget-1.0.0.tgz\n" +
+						"  gadget:\n" +
+						"  - name: gadget\n" +
+						"    version: \"2.0.0\"\n" +
+						"    urls:\n" +
+						"    - gadget-2.0.0.tgz\n"))
+				case "/widget-1.0.0.tgz", "/gadget-2.0.0.tgz":
+					w.Header().Set("Content-Type", "application/x-tar")
+					_, _ = w.Write([]byte("chart-bytes"))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer upstream.Close()
+
+			r, _ := setupProxyWithIndexTTL(t, tc.repoName, upstream.URL, tc.ttl)
+			for _, file := range pulls {
+				req := httptest.NewRequest(http.MethodGet, "/repository/"+tc.repoName+"/"+file, nil)
+				r.ServeHTTP(httptest.NewRecorder(), req)
+			}
+
+			assert.Equal(t, tc.wantHits, indexHits, tc.hitsWhy)
+		})
+	}
 }
 
 // prefixedUpstream serves a repository rooted at /charts-repo, i.e. a remote whose
@@ -395,9 +522,11 @@ func TestHelm_Proxy_UnknownChartInIndexIsNotFound(t *testing.T) {
 	assert.False(t, hitTgz, "must not fetch a chart the index does not list")
 }
 
-// TestHelm_Proxy_UpstreamForbiddenBecomesNotFound: when the index cannot be
-// read, a 403 from the tarball host is still a miss for group fan-out.
-func TestHelm_Proxy_UpstreamForbiddenBecomesNotFound(t *testing.T) {
+// TestHelm_Proxy_UpstreamForbiddenStaysForbidden: a 403 is mapped to a miss only
+// while a group fans out (see TestGroupMerge_HelmTarballSkipsUnreadableMember).
+// Addressed directly, the proxy reports it as it is — a credential upstream
+// rejects must not read as "no such chart".
+func TestHelm_Proxy_UpstreamForbiddenStaysForbidden(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte(`<Error><Code>AccessDenied</Code></Error>`))
@@ -408,5 +537,5 @@ func TestHelm_Proxy_UpstreamForbiddenBecomesNotFound(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/repository/helm-denied/cilium-1.16.0.tgz", nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+	assert.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
 }

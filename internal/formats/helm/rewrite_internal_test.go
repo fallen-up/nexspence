@@ -16,6 +16,7 @@ func TestRewriteChartURL(t *testing.T) {
 		name       string
 		remoteBase string
 		url        string
+		canonical  string // the entry's own "<name>-<version>.tgz", when it names both
 		want       string
 	}{
 		// ── Case 1: repository-relative ──────────────────────────────
@@ -105,6 +106,33 @@ func TestRewriteChartURL(t *testing.T) {
 			want:       local + "x-1.0.0.tgz",
 		},
 		{
+			// The download handler recovers the origin from the minted filename, so
+			// an off-host chart is proxied under the entry's own coordinates. Taking
+			// the origin's basename here made "widget.tgz" split into version 0.0.0
+			// and the index lookup miss — a 404 on a chart that used to be reachable.
+			name:       "off-host origin is proxied under the entry's canonical name",
+			remoteBase: "https://charts.example.com",
+			url:        "https://github.com/o/r/releases/download/v1.0.0/widget.tgz",
+			canonical:  "widget-1.0.0.tgz",
+			want:       local + "widget-1.0.0.tgz",
+		},
+		{
+			name:       "version prefixed with v in the origin name is canonicalized too",
+			remoteBase: "https://charts.example.com",
+			url:        "https://github.com/o/r/releases/download/v1.0.0/widget-v1.0.0.tgz",
+			canonical:  "widget-1.0.0.tgz",
+			want:       local + "widget-1.0.0.tgz",
+		},
+		{
+			// A subtree-relative entry is served by forwarding the request path, so
+			// its directory must survive even when the entry's name differs.
+			name:       "canonical name does not touch an entry inside the subtree",
+			remoteBase: "https://charts.example.com",
+			url:        "charts/widget.tgz",
+			canonical:  "widget-1.0.0.tgz",
+			want:       local + "charts/widget.tgz",
+		},
+		{
 			// The subtree check must run on the cleaned path. Comparing the raw one
 			// would see the "/base/" prefix, strip it, and only then collapse the
 			// "..", silently proxying a different upstream file.
@@ -186,7 +214,7 @@ func TestRewriteChartURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, rewriteChartURL(tt.url, tt.remoteBase, local))
+			assert.Equal(t, tt.want, rewriteChartURL(tt.url, tt.remoteBase, local, tt.canonical))
 		})
 	}
 }
