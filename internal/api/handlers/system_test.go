@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -286,6 +287,28 @@ func TestSystem_Services_DockerConnectorEnabledNoBaseDomain(t *testing.T) {
 	dsc, ok := findService(svcs, "Docker Subdomain Connector")
 	require.True(t, ok)
 	assert.Equal(t, "warn", dsc.Status)
+}
+
+// TestSystem_Services_EveryStatusHasCheckedAt guards the whole response: a check
+// that reports config instead of probing (the Docker connector) used to leave the
+// timestamp empty, which the admin page rendered as "Invalid Date".
+func TestSystem_Services_EveryStatusHasCheckedAt(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Docker.SubdomainConnector.Enabled = true
+	cfg.Docker.SubdomainConnector.BaseDomain = "docker.example.com"
+	cfg.Redis.Enabled = true
+	r := mountSystem(t, cfg, nil, nil, nil, nil)
+
+	rec := do(t, r, http.MethodGet, "/api/v1/system/services", nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	svcs := parseServices(t, rec.Body.Bytes())
+	require.NotEmpty(t, svcs)
+
+	for _, s := range svcs {
+		assert.NotEmpty(t, s.CheckedAt, "%s reports no check time", s.Name)
+		_, err := time.Parse(time.RFC3339, s.CheckedAt)
+		assert.NoError(t, err, "%s: %q is not RFC3339", s.Name, s.CheckedAt)
+	}
 }
 
 // TestSystem_Services_RedisEnabled covers the redis error branch (unreachable addr).

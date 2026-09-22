@@ -1122,6 +1122,14 @@ export default function AdminPage() {
     staleTime: 30_000,
   })
 
+  // The checks run in one request, so every row carries the same second; the
+  // panel states it once instead.
+  const servicesCheckedAt = services?.reduce<Date | null>((latest, svc) => {
+    const at = svc.checked_at ? new Date(svc.checked_at) : null
+    if (!at || Number.isNaN(at.getTime())) return latest
+    return !latest || at > latest ? at : latest
+  }, null) ?? null
+
   const quotaMut = useMutation({
     mutationFn: ({ bs, gb }: { bs: BlobStore; gb: string }) => {
       const bytes = gb.trim() === '' ? null : Math.round(parseFloat(gb) * 1024 * 1024 * 1024)
@@ -1218,14 +1226,21 @@ export default function AdminPage() {
             <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--holo-text-dim)', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'flex', alignItems: 'center', gap: 8 }}>
               <Wifi size={14} /> Service Connections
             </div>
-            <HoloButton
-              style={{ padding: '4px 8px' }}
-              onClick={() => refetchServices()}
-              disabled={servicesFetching}
-              title="Re-run checks"
-            >
-              <RefreshCw size={13} style={{ animation: servicesFetching ? 'spin 1s linear infinite' : 'none' }} />
-            </HoloButton>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              {servicesCheckedAt && (
+                <span style={{ fontSize: 11, color: 'var(--holo-text-faint)' }}>
+                  Checked {servicesCheckedAt.toLocaleTimeString()}
+                </span>
+              )}
+              <HoloButton
+                style={{ padding: '4px 8px' }}
+                onClick={() => refetchServices()}
+                disabled={servicesFetching}
+                title="Re-run checks"
+              >
+                <RefreshCw size={13} style={{ animation: servicesFetching ? 'spin 1s linear infinite' : 'none' }} />
+              </HoloButton>
+            </div>
           </div>
           {!services ? (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -1255,7 +1270,6 @@ export default function AdminPage() {
                     </div>
                     <div style={{ textAlign: 'right' as const, fontSize: 11, color: 'var(--holo-text-faint)', whiteSpace: 'nowrap' as const }}>
                       {svc.latency_ms != null && <span style={{ color: svc.latency_ms < 50 ? 'var(--holo-green)' : svc.latency_ms < 200 ? 'var(--holo-amber)' : 'var(--holo-red)' }}>{svc.latency_ms}ms</span>}
-                      <div style={{ marginTop: 2 }}>{new Date(svc.checked_at).toLocaleTimeString()}</div>
                     </div>
                   </div>
                 )
