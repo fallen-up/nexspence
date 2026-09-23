@@ -1300,7 +1300,6 @@ function PrivilegesTab({ admin }: { admin: boolean }) {
         <div>
           <div style={{ fontSize: 12, color: 'var(--holo-text-dim)', marginBottom: 4 }}>Content Selector *</div>
           <Select
-            searchable
             options={[
               { value: '', label: '— select a content selector —' },
               ...selectors.map(s => ({ value: s.id, label: s.name })),

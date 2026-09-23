@@ -1,5 +1,5 @@
 // frontend/src/components/Select.tsx
-import { CSSProperties, ReactNode, useEffect, useRef, useState } from 'react'
+import { CSSProperties, FocusEvent, ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { ChevronDown } from 'lucide-react'
 
@@ -16,8 +16,6 @@ interface SelectProps {
   onChange: (value: string) => void
   placeholder?: string
   disabled?: boolean
-  // Unused: the open trigger is always the filter. Kept so callers still type-check.
-  searchable?: boolean
   style?: CSSProperties
 }
 
@@ -34,14 +32,21 @@ export function Select({
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [dropPos, setDropPos] = useState<{ top: number; left: number; width: number } | null>(null)
-  const triggerRef = useRef<HTMLDivElement>(null)
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const pillRef = useRef<HTMLElement | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const dropdownRef = useRef<HTMLDivElement>(null)
+  const restoreFocus = useRef(false)
   const selected = options.find(o => o.value === value)
 
+  function bindPill(node: HTMLElement | null) {
+    pillRef.current = node
+  }
+
   function placeMenu() {
-    if (!triggerRef.current) return
-    const r = triggerRef.current.getBoundingClientRect()
+    const pill = pillRef.current
+    if (!pill) return
+    const r = pill.getBoundingClientRect()
     setDropPos({ top: r.bottom + 4, left: r.left, width: r.width })
   }
 
@@ -51,25 +56,41 @@ export function Select({
     setOpen(true)
   }
 
-  function closeMenu() {
+  const closeMenu = useCallback((restore = false) => {
+    if (restore) restoreFocus.current = true
     setOpen(false)
+  }, [])
+
+  function onWrapBlur(e: FocusEvent<HTMLDivElement>) {
+    if (!open) return
+    const next = e.relatedTarget as Node | null
+    if (!next) return
+    if (wrapRef.current?.contains(next) || dropdownRef.current?.contains(next)) return
+    closeMenu(false)
   }
 
   useEffect(() => {
-    if (!open) { setSearch(''); return }
+    if (!open) {
+      setSearch('')
+      if (restoreFocus.current) {
+        restoreFocus.current = false
+        pillRef.current?.focus()
+      }
+      return
+    }
     inputRef.current?.focus()
     function onScroll(e: Event) {
       if (dropdownRef.current?.contains(e.target as Node)) return
-      setOpen(false)
+      closeMenu(false)
     }
-    function onResize() { setOpen(false) }
-    function onKey(e: KeyboardEvent) { if (e.key === 'Escape') setOpen(false) }
+    function onResize() { closeMenu(false) }
+    function onKey(e: KeyboardEvent) { if (e.key === 'Escape') closeMenu(true) }
     function onMouseDown(e: MouseEvent) {
       const t = e.target as Node
       if (
-        triggerRef.current && !triggerRef.current.contains(t) &&
+        wrapRef.current && !wrapRef.current.contains(t) &&
         dropdownRef.current && !dropdownRef.current.contains(t)
-      ) setOpen(false)
+      ) closeMenu(false)
     }
     document.addEventListener('mousedown', onMouseDown)
     document.addEventListener('keydown', onKey)
@@ -81,13 +102,13 @@ export function Select({
       window.removeEventListener('scroll', onScroll, true)
       window.removeEventListener('resize', onResize)
     }
-  }, [open])
+  }, [open, closeMenu])
 
   const visible = search.trim() ? options.filter(o => matches(o, search.trim())) : options
 
   function pick(v: string) {
     onChange(v)
-    closeMenu()
+    closeMenu(true)
   }
 
   const triggerStyle: CSSProperties = {
@@ -111,6 +132,7 @@ export function Select({
       ref={dropdownRef}
       className="holo-card"
       role="listbox"
+      onMouseDown={e => e.preventDefault()}
       style={{
         position: 'fixed',
         top: dropPos.top,
@@ -170,9 +192,9 @@ export function Select({
   ) : null
 
   return (
-    <div ref={triggerRef} style={{ position: 'relative' }}>
+    <div ref={wrapRef} onBlur={onWrapBlur} style={{ position: 'relative' }}>
       {open ? (
-        <div style={triggerStyle}>
+        <div ref={bindPill} style={triggerStyle}>
           <input
             ref={inputRef}
             role="combobox"
@@ -197,7 +219,7 @@ export function Select({
           <button
             type="button"
             aria-label="Close"
-            onClick={closeMenu}
+            onClick={() => closeMenu(true)}
             style={{
               display: 'flex', alignItems: 'center', padding: 0, border: 'none',
               background: 'transparent', cursor: 'pointer', color: 'var(--holo-text-faint)',
@@ -207,7 +229,7 @@ export function Select({
           </button>
         </div>
       ) : (
-        <button type="button" disabled={disabled} onClick={openMenu} style={triggerStyle}>
+        <button ref={bindPill} type="button" disabled={disabled} onClick={openMenu} style={triggerStyle}>
           <span style={{ flex: 1 }}>
             {selected ? selected.label : placeholder}
           </span>
