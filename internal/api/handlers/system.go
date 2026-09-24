@@ -207,6 +207,7 @@ func (h *SystemHandler) Services(c *gin.Context) {
 		}
 	}
 
+	startedAt := time.Now().UTC().Format(time.RFC3339)
 	results := make([]ServiceStatus, len(checks))
 	var wg sync.WaitGroup
 	for i, fn := range checks {
@@ -221,6 +222,14 @@ func (h *SystemHandler) Services(c *gin.Context) {
 		}(i, fn)
 	}
 	wg.Wait()
+
+	// A check that reports config rather than probing something has no time of
+	// its own, and an empty timestamp reaches the UI as "Invalid Date".
+	for i := range results {
+		if results[i].CheckedAt == "" {
+			results[i].CheckedAt = startedAt
+		}
+	}
 
 	c.JSON(http.StatusOK, results)
 }

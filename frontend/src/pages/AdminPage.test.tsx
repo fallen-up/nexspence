@@ -55,6 +55,20 @@ describe('AdminPage — Info tab', () => {
     expect(screen.getAllByText('Docker Subdomain Connector').length).toBeGreaterThan(0)
   })
 
+  it('states the check time once and survives a status without one', async () => {
+    server.use(
+      http.get('/api/v1/system/services', () =>
+        HttpResponse.json([
+          { name: 'PostgreSQL', status: 'ok', latency_ms: 12, detail: 'connected', checked_at: '2026-09-22T08:31:52Z' },
+          { name: 'Docker Subdomain Connector', status: 'ok', detail: 'Active *.docker.example.com', checked_at: '' },
+        ]),
+      ),
+    )
+    renderAdmin('info')
+    expect(await screen.findByText(/^Checked /)).toBeInTheDocument()
+    expect(screen.queryByText(/Invalid Date/)).not.toBeInTheDocument()
+  })
+
   it('shows offline status and disabled docker connector', async () => {
     server.use(
       http.get('/service/rest/v1/status', () => HttpResponse.json({ status: 'down' })),

@@ -142,7 +142,7 @@ export function Select({
         zIndex: 100,
         padding: 6,
         display: 'flex', flexDirection: 'column', gap: 2,
-        boxShadow: '0 12px 40px rgba(0,0,0,0.6)',
+        boxShadow: '0 12px 40px var(--holo-shadow-60)',
         maxHeight: 280,
         overflowY: 'auto' as const,
       }}
@@ -164,7 +164,7 @@ export function Select({
               display: 'flex', alignItems: 'center', gap: 8,
               padding: '7px 12px',
               cursor: 'pointer', fontSize: 13,
-              color: isSel ? '#c4b5fd' : 'var(--holo-text)',
+              color: isSel ? 'var(--holo-c-violet-300)' : 'var(--holo-text)',
               background: isSel ? 'rgba(124,92,255,0.18)' : 'transparent',
               border: isSel ? '1px solid rgba(124,92,255,0.35)' : '1px solid transparent',
               borderRadius: isSel ? 10 : 8,
@@ -179,7 +179,7 @@ export function Select({
             }}
           >
             {isSel && (
-              <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#7c5cff', boxShadow: '0 0 6px #7c5cff', flexShrink: 0, display: 'inline-block' }} />
+              <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--holo-a)', boxShadow: '0 0 6px var(--holo-a)', flexShrink: 0, display: 'inline-block' }} />
             )}
             <span style={{ flex: 1 }}>{opt.label}</span>
             {opt.badge}

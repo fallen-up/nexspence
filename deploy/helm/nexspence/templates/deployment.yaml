@@ -99,7 +99,7 @@ spec:
                   name: {{ .Values.config.jwtSecretExistingSecret }}
                   key: {{ .Values.config.jwtSecretExistingSecretKey | default "jwt-secret" }}
             {{- end }}
-            {{- if .Values.config.adminExistingSecret }}
+            {{- if and .Values.config.bootstrapEnabled .Values.config.adminExistingSecret }}
             - name: NEXSPENCE_BOOTSTRAP_ADMIN_USERNAME
               valueFrom:
                 secretKeyRef:
@@ -174,6 +174,13 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.oidc.clientSecretExistingSecret }}
                   key: {{ .Values.oidc.clientSecretExistingSecretKey | default "client-secret" }}
+            {{- end }}
+            {{- if and .Values.oidc.enabled .Values.oidc.cookieKeyExistingSecret }}
+            - name: NEXSPENCE_OIDC_COOKIE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.oidc.cookieKeyExistingSecret }}
+                  key: {{ .Values.oidc.cookieKeyExistingSecretKey | default "oidc-cookie-key" }}
             {{- end }}
             {{- if and .Values.oidc.enabled .Values.oidc.googleAdminSDK.enabled }}
             - name: NEXSPENCE_OIDC_GOOGLE_ADMIN_SDK_SERVICE_ACCOUNT_KEY
