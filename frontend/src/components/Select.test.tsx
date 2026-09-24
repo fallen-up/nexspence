@@ -39,25 +39,35 @@ describe('Select', () => {
     expect(screen.queryByText('Alpha')).not.toBeInTheDocument()
   })
 
-  it('toggles closed on a second trigger click', async () => {
+  it('closes when the open chevron is clicked', async () => {
     render(<Select options={opts} value="" onChange={() => {}} />)
-    const trigger = screen.getByRole('button')
-    await userEvent.click(trigger)
+    await userEvent.click(screen.getByRole('button'))
     expect(screen.getByText('Alpha')).toBeInTheDocument()
-    await userEvent.click(trigger)
+    // The trigger is the combobox now; the chevron sits next to it.
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }))
     expect(screen.queryByText('Alpha')).not.toBeInTheDocument()
+    expect(screen.getByRole('button')).toHaveFocus()
   })
 
-  it('filters options when searchable and shows "No matches"', async () => {
-    render(<Select options={opts} value="" onChange={() => {}} searchable />)
+  it('filters the open list as you type in the trigger', async () => {
+    render(<Select options={opts} value="" onChange={() => {}} />)
     await userEvent.click(screen.getByRole('button'))
-    const filter = screen.getByPlaceholderText('Filter…')
-    await userEvent.type(filter, 'alp')
+    const box = screen.getByRole('combobox')
+    await userEvent.type(box, 'alp')
     expect(screen.getByText('Alpha')).toBeInTheDocument()
     expect(screen.queryByText('Beta')).not.toBeInTheDocument()
-    await userEvent.clear(filter)
-    await userEvent.type(filter, 'zzz')
+    await userEvent.clear(box)
+    await userEvent.type(box, 'zzz')
     expect(screen.getByText('No matches')).toBeInTheDocument()
+  })
+
+  it('Enter picks the first match after a filter', async () => {
+    const onChange = vi.fn()
+    render(<Select options={opts} value="" onChange={onChange} />)
+    await userEvent.click(screen.getByRole('button'))
+    await userEvent.type(screen.getByRole('combobox'), 'bet{Enter}')
+    expect(onChange).toHaveBeenCalledWith('b')
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
   })
 
   it('shows "No options" when given an empty list', async () => {
@@ -74,7 +84,7 @@ describe('Select', () => {
     expect(screen.getByTestId('badge')).toBeInTheDocument()
     expect(screen.getByTestId('tag')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button'))
-    // Now both trigger and list render badge/tag.
+    // Open trigger is the filter; badges stay on the list row.
     expect(screen.getAllByTestId('badge').length).toBeGreaterThan(0)
   })
 
@@ -108,6 +118,51 @@ describe('Select', () => {
     // The selected row "Beta" appears in the list.
     const rows = screen.getAllByText('Beta')
     expect(rows.length).toBeGreaterThan(0)
+  })
+
+  it('sizes the menu from the pill, not the wrapper', async () => {
+    render(
+      <div style={{ width: 800 }}>
+        <Select options={opts} value="" onChange={() => {}} style={{ width: 360 }} />
+      </div>,
+    )
+    const pill = screen.getByRole('button')
+    vi.spyOn(pill, 'getBoundingClientRect').mockReturnValue({
+      x: 12, y: 8, top: 8, left: 12, bottom: 40, right: 372,
+      width: 360, height: 32, toJSON() { return {} },
+    })
+    await userEvent.click(pill)
+    expect(screen.getByRole('listbox')).toHaveStyle({ width: '360px', left: '12px' })
+  })
+
+  it('returns focus to the trigger after Escape', async () => {
+    render(<Select options={opts} value="" onChange={() => {}} placeholder="Pick one" />)
+    await userEvent.click(screen.getByRole('button', { name: /Pick one/ }))
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.getByRole('button', { name: /Pick one/ })).toHaveFocus()
+  })
+
+  it('returns focus to the trigger after a choice', async () => {
+    render(<Select options={opts} value="" onChange={() => {}} />)
+    await userEvent.click(screen.getByRole('button'))
+    await userEvent.click(screen.getByText('Gamma'))
+    expect(screen.getByRole('button')).toHaveFocus()
+  })
+
+  it('closes when tab leaves the combobox and keeps the new focus', async () => {
+    render(
+      <>
+        <Select options={opts} value="" onChange={() => {}} />
+        <button type="button">next</button>
+      </>,
+    )
+    await userEvent.click(screen.getByRole('button', { name: /Select/ }))
+    expect(screen.getByRole('listbox')).toBeInTheDocument()
+    await userEvent.tab()
+    expect(screen.getByRole('listbox')).toBeInTheDocument()
+    await userEvent.tab()
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'next' })).toHaveFocus()
   })
 
   it('applies hover background on mouse enter/leave', async () => {

@@ -54,6 +54,19 @@ describe('BrowsePage — repo selector & empty states', () => {
     expect(await screen.findByText('No components in this repository')).toBeInTheDocument()
   })
 
+  it('types in the repository selector and shrinks the list', async () => {
+    const user = userEvent.setup()
+    renderBrowse()
+    await screen.findByText('Choose a repository above')
+    await user.click(screen.getByRole('button', { name: /Select repository/ }))
+    expect(screen.getByRole('option', { name: /maven-hosted/ })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: /docker-hosted/ })).toBeInTheDocument()
+    await user.type(screen.getByRole('combobox'), 'dock')
+    expect(screen.getByRole('option', { name: /docker-hosted/ })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: /maven-hosted/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: /raw-hosted/ })).not.toBeInTheDocument()
+  })
+
   it('lists components with assets, bulk-selects and shows promote bar', async () => {
     const user = userEvent.setup()
     server.use(
