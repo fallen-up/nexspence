@@ -770,16 +770,19 @@ type ReplicationHistory struct {
 
 // PromotionRule defines a promotion route between two repositories.
 type PromotionRule struct {
-	ID                    string    `json:"id"`
-	Name                  string    `json:"name"`
-	FromRepo              string    `json:"from_repo"`
-	ToRepo                string    `json:"to_repo"`
-	PathFilter            string    `json:"path_filter,omitempty"` // CEL expression; empty = all paths
-	RequireScanPass       bool      `json:"require_scan_pass"`
-	ScanFailSeverities    []string  `json:"scan_fail_severities,omitempty"` // fail require_scan_pass; empty = DefaultScanFailSeverities (#543)
-	RequireManualApproval bool      `json:"require_manual_approval"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	ID                    string   `json:"id"`
+	Name                  string   `json:"name"`
+	FromRepo              string   `json:"from_repo"`
+	ToRepo                string   `json:"to_repo"`
+	PathFilter            string   `json:"path_filter,omitempty"` // CEL expression; empty = all paths
+	RequireScanPass       bool     `json:"require_scan_pass"`
+	ScanFailSeverities    []string `json:"scan_fail_severities,omitempty"` // fail require_scan_pass; empty = DefaultScanFailSeverities (#543)
+	RequireManualApproval bool     `json:"require_manual_approval"`
+	// AutoPromote starts the rule by itself when a client publishes a matching
+	// component into FromRepo (#542). Every other gate still applies.
+	AutoPromote bool      `json:"auto_promote"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // PromotionStatus is the lifecycle state of a build-promotion request.
@@ -800,15 +803,46 @@ type PromotionRequest struct {
 	RuleID      string          `json:"rule_id"`
 	ComponentID string          `json:"component_id"`
 	Status      PromotionStatus `json:"status"`
-	RequestedBy string          `json:"requested_by"`
-	ReviewedBy  *string         `json:"reviewed_by,omitempty"`
-	ReviewedAt  *time.Time      `json:"reviewed_at,omitempty"`
-	CompletedAt *time.Time      `json:"completed_at,omitempty"`
-	Error       string          `json:"error,omitempty"`
-	CreatedAt   time.Time       `json:"created_at"`
+	// RequestedBy is the user who asked for the promotion; empty for an
+	// Automatic one, which no user filed.
+	RequestedBy string `json:"requested_by"`
+	// Automatic marks a request filed by auto-promotion on publish (#542)
+	// rather than by a Promote call.
+	Automatic bool `json:"automatic"`
+	// PublishedAt is, for an Automatic request, when the component was last
+	// published as of its last evaluation — the publish a scan must postdate
+	// for Approve to go ahead.
+	PublishedAt *time.Time `json:"published_at,omitempty"`
+	ReviewedBy  *string    `json:"reviewed_by,omitempty"`
+	ReviewedAt  *time.Time `json:"reviewed_at,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	Error       string     `json:"error,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
 	// IncludedComponents counts the components promoted along with this one
 	// because they belong to the same Docker/OCI image — digest alias, config
 	// and layer blobs, child manifests (#541). Reported by Promote only; it is
 	// not persisted, so listed requests carry zero.
 	IncludedComponents int `json:"included_components,omitempty"`
+}
+
+// AutoPromotionEntry is one queued evaluation of an auto_promote rule for a
+// component a client published into the rule's from_repo (#542).
+type AutoPromotionEntry struct {
+	ID          string
+	RuleID      string
+	ComponentID string
+	// LastPublishedAt is when the component last received an asset.
+	LastPublishedAt time.Time
+	DueAt           time.Time
+	// Generation changes with every publish into the component; a worker
+	// finishes only the generation it evaluated.
+	Generation int64
+	// Attempts counts transient failures only.
+	Attempts       int
+	WaitingForScan bool
+	// Started is whether this generation's start was audited.
+	Started bool
+	Reason  string
+	// ClaimToken names the claim this entry was handed out under.
+	ClaimToken string
 }

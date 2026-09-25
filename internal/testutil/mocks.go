@@ -2839,6 +2839,51 @@ func (r *PromotionRepo) WithPendingRequestLock(ctx context.Context, id string,
 	return nil
 }
 
+// CreateAutoRequest mirrors the postgres partial unique index: one pending
+// automatic request per (rule, component).
+func (r *PromotionRepo) CreateAutoRequest(_ context.Context, req *domain.PromotionRequest) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	req.Automatic = true
+	req.RequestedBy = ""
+	if req.Status == domain.PromotionPending {
+		for _, v := range r.Requests {
+			if v.Automatic && v.Status == domain.PromotionPending &&
+				v.RuleID == req.RuleID && v.ComponentID == req.ComponentID {
+				if req.PublishedAt != nil && (v.PublishedAt == nil || req.PublishedAt.After(*v.PublishedAt)) {
+					t := *req.PublishedAt
+					v.PublishedAt = &t
+				}
+				*req = *v
+				return false, nil
+			}
+		}
+	}
+	req.ID = r.genID()
+	req.CreatedAt = time.Now()
+	cp := *req
+	r.Requests[req.ID] = &cp
+	return true, nil
+}
+
+// FailPendingAutoRequests mirrors the postgres UPDATE of the pair's pending
+// automatic request.
+func (r *PromotionRepo) FailPendingAutoRequests(_ context.Context, ruleID, componentID, reason string) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	now := time.Now()
+	for _, v := range r.Requests {
+		if v.Automatic && v.Status == domain.PromotionPending && v.RuleID == ruleID && v.ComponentID == componentID {
+			v.Status = domain.PromotionFailed
+			v.Error = reason
+			v.CompletedAt = &now
+			n++
+		}
+	}
+	return n, nil
+}
+
 // PutBytes is a test helper that stores raw bytes under key in the BlobStore mock.
 func (b *BlobStore) PutBytes(ctx context.Context, key string, data []byte) error {
 	return b.Put(ctx, key, bytes.NewReader(data), int64(len(data)))

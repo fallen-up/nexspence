@@ -22,14 +22,14 @@ func NewPromotionRepo(db *pgxpool.Pool) *promotionRepo {
 }
 
 const promotionRuleFields = `id, name, from_repo, to_repo, path_filter,
-	require_scan_pass, scan_fail_severities, require_manual_approval, created_at, updated_at`
+	require_scan_pass, scan_fail_severities, require_manual_approval, auto_promote, created_at, updated_at`
 
 func scanPromotionRule(row pgx.Row) (*domain.PromotionRule, error) {
 	var r domain.PromotionRule
 	var pf *string
 	err := row.Scan(
 		&r.ID, &r.Name, &r.FromRepo, &r.ToRepo, &pf,
-		&r.RequireScanPass, &r.ScanFailSeverities, &r.RequireManualApproval, &r.CreatedAt, &r.UpdatedAt,
+		&r.RequireScanPass, &r.ScanFailSeverities, &r.RequireManualApproval, &r.AutoPromote, &r.CreatedAt, &r.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -103,11 +103,11 @@ func (r *promotionRepo) CreateRule(ctx context.Context, rule *domain.PromotionRu
 	}
 	return r.db.QueryRow(ctx,
 		`INSERT INTO promotion_rules
-		  (name, from_repo, to_repo, path_filter, require_scan_pass, require_manual_approval, scan_fail_severities)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7)
+		  (name, from_repo, to_repo, path_filter, require_scan_pass, require_manual_approval, scan_fail_severities, auto_promote)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
 		 RETURNING id, created_at, updated_at`,
 		rule.Name, rule.FromRepo, rule.ToRepo, pf,
-		rule.RequireScanPass, rule.RequireManualApproval, scanFailSeveritiesArg(rule),
+		rule.RequireScanPass, rule.RequireManualApproval, scanFailSeveritiesArg(rule), rule.AutoPromote,
 	).Scan(&rule.ID, &rule.CreatedAt, &rule.UpdatedAt)
 }
 
@@ -119,10 +119,11 @@ func (r *promotionRepo) UpdateRule(ctx context.Context, rule *domain.PromotionRu
 	_, err := r.db.Exec(ctx,
 		`UPDATE promotion_rules
 		 SET name=$1, from_repo=$2, to_repo=$3, path_filter=$4,
-		     require_scan_pass=$5, require_manual_approval=$6, scan_fail_severities=$8, updated_at=now()
+		     require_scan_pass=$5, require_manual_approval=$6, scan_fail_severities=$8, auto_promote=$9,
+		     updated_at=now()
 		 WHERE id=$7`,
 		rule.Name, rule.FromRepo, rule.ToRepo, pf,
-		rule.RequireScanPass, rule.RequireManualApproval, rule.ID, scanFailSeveritiesArg(rule),
+		rule.RequireScanPass, rule.RequireManualApproval, rule.ID, scanFailSeveritiesArg(rule), rule.AutoPromote,
 	)
 	return err
 }
@@ -132,21 +133,24 @@ func (r *promotionRepo) DeleteRule(ctx context.Context, id string) error {
 	return err
 }
 
-const promotionReqFields = `id, rule_id, component_id, status, requested_by,
+const promotionReqFields = `id, rule_id, component_id, status, requested_by, automatic, published_at,
 	reviewed_by, reviewed_at, completed_at, error, created_at`
 
 func scanPromotionRequest(row pgx.Row) (*domain.PromotionRequest, error) {
 	var req domain.PromotionRequest
 	var status string
-	var errMsg *string
+	var errMsg, requestedBy *string
 	err := row.Scan(
-		&req.ID, &req.RuleID, &req.ComponentID, &status, &req.RequestedBy,
+		&req.ID, &req.RuleID, &req.ComponentID, &status, &requestedBy, &req.Automatic, &req.PublishedAt,
 		&req.ReviewedBy, &req.ReviewedAt, &req.CompletedAt, &errMsg, &req.CreatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 	req.Status = domain.PromotionStatus(status)
+	if requestedBy != nil {
+		req.RequestedBy = *requestedBy
+	}
 	if errMsg != nil {
 		req.Error = *errMsg
 	}
@@ -160,6 +164,55 @@ func (r *promotionRepo) CreateRequest(ctx context.Context, req *domain.Promotion
 		 RETURNING id, created_at`,
 		req.RuleID, req.ComponentID, string(req.Status), req.RequestedBy,
 	).Scan(&req.ID, &req.CreatedAt)
+}
+
+// CreateAutoRequest inserts an automatic request. The partial unique index
+// idx_promotion_requests_auto_pending admits one pending automatic request per
+// (rule, component); a second pending insert updates the first's published_at
+// (forward only) and reads it back instead.
+func (r *promotionRepo) CreateAutoRequest(ctx context.Context, req *domain.PromotionRequest) (bool, error) {
+	req.Automatic = true
+	req.RequestedBy = ""
+	var em *string
+	if req.Error != "" {
+		em = &req.Error
+	}
+	var inserted bool
+	err := r.db.QueryRow(ctx,
+		`INSERT INTO promotion_requests
+		   (rule_id, component_id, status, requested_by, automatic, completed_at, error, published_at)
+		 VALUES ($1,$2,$3,NULL,true,$4,$5,$6)
+		 ON CONFLICT (rule_id, component_id) WHERE automatic AND status = 'pending' DO UPDATE
+		 SET published_at = GREATEST(promotion_requests.published_at, EXCLUDED.published_at)
+		 RETURNING id, created_at, published_at, (xmax = 0)`,
+		req.RuleID, req.ComponentID, string(req.Status), req.CompletedAt, em, req.PublishedAt,
+	).Scan(&req.ID, &req.CreatedAt, &req.PublishedAt, &inserted)
+	if err != nil {
+		return false, err
+	}
+	if inserted {
+		return true, nil
+	}
+	existing, err := r.GetRequest(ctx, req.ID)
+	if err != nil {
+		return false, err
+	}
+	*req = *existing
+	return false, nil
+}
+
+// FailPendingAutoRequests settles the pending automatic request of the pair as
+// failed. A reviewer approving it at the same moment holds its row lock; the
+// UPDATE waits, re-reads the status and leaves a settled row alone.
+func (r *promotionRepo) FailPendingAutoRequests(ctx context.Context, ruleID, componentID, reason string) (int, error) {
+	tag, err := r.db.Exec(ctx,
+		`UPDATE promotion_requests SET status = 'failed', completed_at = now(), error = $3
+		 WHERE rule_id = $1 AND component_id = $2 AND automatic AND status = 'pending'`,
+		ruleID, componentID, reason)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 func (r *promotionRepo) GetRequest(ctx context.Context, id string) (*domain.PromotionRequest, error) {
