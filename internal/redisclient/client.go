@@ -73,6 +73,27 @@ func (c *Client) DelIfMatch(ctx context.Context, key, value string) (bool, error
 	return n > 0, nil
 }
 
+// expireIfMatchScript is the refresh counterpart of delIfMatchScript: a lock
+// holder may only extend the key's TTL while it still carries its own token.
+var expireIfMatchScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+else
+	return 0
+end
+`)
+
+// ExpireIfMatch atomically resets key's TTL only if it currently holds value.
+// Returns true if the TTL was reset, false if the key was missing or held a
+// different value.
+func (c *Client) ExpireIfMatch(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	n, err := expireIfMatchScript.Run(ctx, c.rdb, []string{key}, value, ttl.Milliseconds()).Int64()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // Ping checks connectivity to Redis.
 func (c *Client) Ping(ctx context.Context) error {
 	return c.rdb.Ping(ctx).Err()

@@ -14,10 +14,12 @@ type stubRedis struct {
 	setNXf    func(key string) (bool, error)
 	delf      func(key string) error
 	delMatchf func(key, value string) (bool, error)
+	expiref   func(key, value string) (bool, error)
+	ttls      map[string]time.Duration
 }
 
 func newStubRedis() *stubRedis {
-	return &stubRedis{keys: make(map[string]string)}
+	return &stubRedis{keys: make(map[string]string), ttls: make(map[string]time.Duration)}
 }
 
 func (s *stubRedis) SetNX(_ context.Context, key, value string, _ time.Duration) (bool, error) {
@@ -50,6 +52,54 @@ func (s *stubRedis) DelIfMatch(_ context.Context, key, value string) (bool, erro
 	}
 	delete(s.keys, key)
 	return true, nil
+}
+
+// ExpireIfMatch models the Redis-side compare-and-expire: the TTL is reset
+// only while the key still holds the exact value the caller wrote.
+func (s *stubRedis) ExpireIfMatch(_ context.Context, key, value string, ttl time.Duration) (bool, error) {
+	if s.expiref != nil {
+		return s.expiref(key, value)
+	}
+	if cur, exists := s.keys[key]; !exists || cur != value {
+		return false, nil
+	}
+	s.ttls[key] = ttl
+	return true, nil
+}
+
+func TestRedisLock_Refresh(t *testing.T) {
+	ctx := context.Background()
+	stub := newStubRedis()
+	lock, err := distlock.NewRedisLocker(stub).Acquire(ctx, "k", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	r, ok := lock.(distlock.Refresher)
+	if !ok {
+		t.Fatal("redis lock must implement distlock.Refresher")
+	}
+	if err := r.Refresh(ctx, time.Hour); err != nil {
+		t.Fatalf("refresh of a held lock: %v", err)
+	}
+	if stub.ttls["k"] != time.Hour {
+		t.Fatalf("ttl = %v, want 1h", stub.ttls["k"])
+	}
+
+	// Expired and taken by another holder: refreshing must not extend the
+	// other holder's lock, and must say the lock is lost.
+	stub.keys["k"] = "someone-else"
+	delete(stub.ttls, "k")
+	if err := r.Refresh(ctx, time.Hour); !errors.Is(err, distlock.ErrLockLost) {
+		t.Fatalf("refresh of a lost lock: err = %v, want ErrLockLost", err)
+	}
+	if _, touched := stub.ttls["k"]; touched {
+		t.Fatal("refresh must not touch a key another holder owns")
+	}
+
+	stub.expiref = func(string, string) (bool, error) { return false, errors.New("redis down") }
+	if err := r.Refresh(ctx, time.Hour); err == nil || errors.Is(err, distlock.ErrLockLost) {
+		t.Fatalf("backend error: err = %v, want a non-ErrLockLost error", err)
+	}
 }
 
 func TestRedisLocker_AcquireRelease(t *testing.T) {

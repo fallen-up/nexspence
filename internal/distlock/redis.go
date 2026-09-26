@@ -15,6 +15,9 @@ type RedisBackend interface {
 	// DelIfMatch deletes key only while it still holds value, reporting whether
 	// it did. It must be atomic on the Redis side.
 	DelIfMatch(ctx context.Context, key, value string) (bool, error)
+	// ExpireIfMatch resets key's TTL only while it still holds value,
+	// reporting whether it did. It must be atomic on the Redis side.
+	ExpireIfMatch(ctx context.Context, key, value string, ttl time.Duration) (bool, error)
 }
 
 // RedisLocker implements Locker using Redis SetNX for mutual exclusion across nodes.
@@ -62,6 +65,20 @@ type redisLock struct {
 func (l *redisLock) Release(ctx context.Context) error {
 	if _, err := l.rdb.DelIfMatch(ctx, l.key, l.token); err != nil {
 		return fmt.Errorf("distlock release %q: %w", l.key, err)
+	}
+	return nil
+}
+
+// Refresh extends the lock's TTL, but only while this holder still owns it:
+// once the key expired or another node took it, extending it would hand that
+// node's lock a TTL it never asked for.
+func (l *redisLock) Refresh(ctx context.Context, ttl time.Duration) error {
+	ok, err := l.rdb.ExpireIfMatch(ctx, l.key, l.token, ttl)
+	if err != nil {
+		return fmt.Errorf("distlock refresh %q: %w", l.key, err)
+	}
+	if !ok {
+		return ErrLockLost
 	}
 	return nil
 }

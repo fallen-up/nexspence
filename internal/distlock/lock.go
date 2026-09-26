@@ -9,6 +9,10 @@ import (
 // ErrLockHeld is returned by Acquire when the lock is already held by another caller.
 var ErrLockHeld = errors.New("distlock: lock already held")
 
+// ErrLockLost is returned by Refresh when the lock is no longer this holder's:
+// it expired, and possibly another caller has taken it since.
+var ErrLockLost = errors.New("distlock: lock no longer held")
+
 // Locker acquires distributed locks identified by key.
 type Locker interface {
 	Acquire(ctx context.Context, key string, ttl time.Duration) (Lock, error)
@@ -22,4 +26,11 @@ type Locker interface {
 // Lock represents an acquired distributed lock that can be released.
 type Lock interface {
 	Release(ctx context.Context) error
+}
+
+// Refresher is implemented by a Lock whose holder can extend its TTL, for work
+// that can outlive the TTL it was acquired with but cannot simply stop at a
+// deadline. Refresh returns ErrLockLost when the lock is no longer held.
+type Refresher interface {
+	Refresh(ctx context.Context, ttl time.Duration) error
 }

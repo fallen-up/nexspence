@@ -87,7 +87,9 @@ func TestExtraBackup_Export_PaginatesComponents(t *testing.T) {
 }
 
 func TestExtraBackup_Export_SkipsMissingBlobGracefully(t *testing.T) {
-	// Asset references a blob key not present in the store — Export skips it, no error.
+	// Asset references a blob key not present in the store — Export still
+	// writes the archive, but reports the blob as missing instead of passing
+	// for a complete backup (#490 review).
 	ctx := context.Background()
 	repo := testutil.SimpleRepo("skipblob", "raw")
 	svc := extraBackupSvc(repo)
@@ -112,7 +114,10 @@ func TestExtraBackup_Export_SkipsMissingBlobGracefully(t *testing.T) {
 	require.NoError(t, svc.Assets.Create(ctx, asset))
 
 	var buf bytes.Buffer
-	require.NoError(t, svc.Export(ctx, &buf))
+	var incomplete *service.IncompleteBackupError
+	require.ErrorAs(t, svc.Export(ctx, &buf), &incomplete)
+	assert.Equal(t, 1, incomplete.Missing)
+	assert.Contains(t, incomplete.Error(), "no/such/blobkey")
 	assert.Greater(t, buf.Len(), 0)
 }
 
@@ -175,7 +180,8 @@ func TestExtraBackup_ExportRepo_EmptyBlobKey_Skipped(t *testing.T) {
 }
 
 func TestExtraBackup_ExportRepo_SkipsMissingBlobKey(t *testing.T) {
-	// BlobKey present but not in blob store — ExportRepo skips gracefully.
+	// BlobKey present but not in blob store — ExportRepo writes the archive
+	// without it and reports it as missing.
 	ctx := context.Background()
 	repo := testutil.SimpleRepo("skiprepo", "raw")
 	svc := extraBackupSvc(repo)
@@ -194,7 +200,9 @@ func TestExtraBackup_ExportRepo_SkipsMissingBlobKey(t *testing.T) {
 	require.NoError(t, svc.Assets.Create(ctx, asset))
 
 	var buf bytes.Buffer
-	require.NoError(t, svc.ExportRepo(ctx, "skiprepo", &buf))
+	var incomplete *service.IncompleteBackupError
+	require.ErrorAs(t, svc.ExportRepo(ctx, "skiprepo", &buf), &incomplete)
+	assert.Equal(t, 1, incomplete.Missing)
 	assert.Greater(t, buf.Len(), 0)
 }
 

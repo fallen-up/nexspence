@@ -107,6 +107,12 @@ export const handlers = [
     HttpResponse.json({ usedBytes: 0, quotaBytes: null })
   ),
 
+  // Scheduled backup settings (Admin > Backup & Restore)
+  http.get('/api/v1/backup/settings', () =>
+    HttpResponse.json({ enabled: false, scheduleCron: '0 3 * * *', retentionCount: 7 })
+  ),
+  http.put('/api/v1/backup/settings', () => new HttpResponse(null, { status: 204 })),
+
   // System / services
   http.get('/api/v1/system/services', () => HttpResponse.json([])),
   http.get('/api/v1/system/info', () =>

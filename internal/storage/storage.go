@@ -44,6 +44,12 @@ type BlobStore interface {
 
 	// ListEntries returns every blob in the store with its size and last-modified
 	// time. Used by GC to age-gate orphan deletion.
+	//
+	// Keys under the reserved "backups/" prefix are scheduled backup archives
+	// (spec 37): they have no asset row by design, and GC skips them rather
+	// than collecting them as orphans. Anything else written to a store
+	// without an asset row is an orphan to GC — a new kind of non-asset key
+	// needs its own reserved prefix and the matching skip in GC.
 	ListEntries(ctx context.Context) ([]BlobEntry, error)
 }
 
@@ -64,6 +70,21 @@ type PresignableStore interface {
 	// ConfigureLifecycle sets a bucket lifecycle expiration rule.
 	// Pass 0 to remove all rules.
 	ConfigureLifecycle(ctx context.Context, expirationDays int32) error
+}
+
+// PrefixListableStore is an optional extension of BlobStore for backends that
+// can filter ListEntries natively by key prefix, instead of listing the whole
+// store and filtering client-side. Check with a type assertion:
+// pl, ok := store.(storage.PrefixListableStore)
+//
+// It exists for callers that only care about one namespace within a store
+// otherwise shared with unrelated product data — e.g. scheduled backups'
+// retention cleanup (spec 37), which would otherwise re-list an entire
+// production bucket on every run just to find its own "backups/" entries.
+type PrefixListableStore interface {
+	// ListEntriesWithPrefix returns every blob whose logical key starts with
+	// prefix, with the same size/mtime semantics as ListEntries.
+	ListEntriesWithPrefix(ctx context.Context, prefix string) ([]BlobEntry, error)
 }
 
 // AppendableBlobStore is an optional extension of BlobStore for backends that

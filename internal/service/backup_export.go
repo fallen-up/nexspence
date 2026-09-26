@@ -34,17 +34,68 @@ func (aw *archiveWriter) Close() error {
 	return errors.Join(aw.tw.Close(), aw.gw.Close())
 }
 
+// closeArchive closes aw into *retErr. A Close failure means a truncated
+// archive, so it replaces an IncompleteBackupError — which promises the
+// archive itself is sound — and otherwise only fills an empty *retErr.
+func closeArchive(aw *archiveWriter, retErr *error) {
+	cerr := aw.Close()
+	if cerr == nil {
+		return
+	}
+	var incomplete *IncompleteBackupError
+	if *retErr == nil || errors.As(*retErr, &incomplete) {
+		*retErr = cerr
+	}
+}
+
+// IncompleteBackupError reports blobs an export had to leave out. The archive
+// itself is complete and valid — every metadata section and every other blob
+// is in it — so a caller may keep it, but must not report it as a full backup.
+type IncompleteBackupError struct {
+	Missing int
+	First   error // the first missing blob's failure, e.g. an S3 auth error
+}
+
+func (e *IncompleteBackupError) Error() string {
+	return fmt.Sprintf("%d blob(s) could not be read and are missing from the archive (first: %v)", e.Missing, e.First)
+}
+
 // writeBlobEntries streams each referenced blob into the archive once
-// (deduplicated by blob key); unreadable blobs are skipped.
+// (deduplicated by blob key). A blob it cannot read — its store does not
+// resolve, or Get fails — is left out and counted rather than skipped
+// silently: the returned *IncompleteBackupError says how many, so a backup
+// that lost bytes cannot pass for a complete one (#490 review).
 func (s *BackupService) writeBlobEntries(ctx context.Context, tw *tar.Writer, assets []domain.Asset) error {
 	seen := map[string]bool{}
+	stores := storeCache{}
+	var missing *IncompleteBackupError
+	skip := func(key string, err error) {
+		if missing == nil {
+			missing = &IncompleteBackupError{First: fmt.Errorf("blob %s: %w", key, err)}
+		}
+		missing.Missing++
+	}
 	for _, a := range assets {
+		// A canceled run (e.g. a scheduled backup that lost its lock) is an
+		// error, not a long list of blobs that "could not be read".
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
 		if a.BlobKey == "" || seen[a.BlobKey] {
 			continue
 		}
 		seen[a.BlobKey] = true
-		rc, size, err := s.BlobStore.Get(ctx, a.BlobKey)
+		store, err := s.resolveStore(ctx, stores, a.BlobStoreID)
 		if err != nil {
+			skip(a.BlobKey, err)
+			continue
+		}
+		rc, size, err := store.Get(ctx, a.BlobKey)
+		if err != nil {
+			if ctx.Err() != nil {
+				return context.Cause(ctx)
+			}
+			skip(a.BlobKey, err)
 			continue
 		}
 		if err := tw.WriteHeader(&tar.Header{
@@ -61,6 +112,9 @@ func (s *BackupService) writeBlobEntries(ctx context.Context, tw *tar.Writer, as
 			return fmt.Errorf("copy blob %s: %w", a.BlobKey, err)
 		}
 		_ = rc.Close()
+	}
+	if missing != nil {
+		return missing
 	}
 	return nil
 }
@@ -104,11 +158,7 @@ func (s *BackupService) Export(ctx context.Context, w io.Writer) (retErr error) 
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if cerr := aw.Close(); cerr != nil && retErr == nil {
-			retErr = cerr
-		}
-	}()
+	defer closeArchive(aw, &retErr)
 	tw := aw.tw
 
 	manifest := map[string]any{
@@ -201,11 +251,7 @@ func (s *BackupService) ExportRepo(ctx context.Context, repoName string, w io.Wr
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if cerr := aw.Close(); cerr != nil && retErr == nil {
-			retErr = cerr
-		}
-	}()
+	defer closeArchive(aw, &retErr)
 	tw := aw.tw
 
 	manifest := map[string]any{
