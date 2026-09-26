@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path"
 	"strings"
 
 	"github.com/nexspence-oss/nexspence/internal/domain"
@@ -37,12 +38,14 @@ var ErrBlobStoreUnavailable = errors.New("blob store unavailable")
 
 // HTTPStatusForError maps known storage errors to appropriate HTTP status codes.
 // Returns 507 Insufficient Storage for quota and out-of-space errors, 400 for a
-// body that contradicts its own declared size, and 500 for everything else.
+// body that contradicts its own declared size or a write the repository's
+// write policy refuses (the status Nexus answers a redeploy with), and 500 for
+// everything else.
 func HTTPStatusForError(err error) int {
 	if errors.Is(err, ErrQuotaExceeded) || errors.Is(err, storage.ErrNoSpace) {
 		return http.StatusInsufficientStorage
 	}
-	if errors.Is(err, ErrSizeMismatch) {
+	if errors.Is(err, ErrSizeMismatch) || errors.Is(err, ErrRedeployDenied) || errors.Is(err, ErrRepositoryReadOnly) {
 		return http.StatusBadRequest
 	}
 	return http.StatusInternalServerError
@@ -60,6 +63,13 @@ type StoreResult struct {
 // StoreArtifact streams reader into the blob store, computes checksums,
 // and upserts the component + asset records in the DB.
 // coords.Version may be empty for formats that don't have versions (e.g. raw).
+//
+// Every hosted format's client deploy goes through here, so this is where a
+// hosted repository's write policy is enforced (#539): deny refuses with
+// ErrRepositoryReadOnly, allow_once refuses a path that already holds an asset
+// with ErrRedeployDenied (see RedeployExempt for the paths it lets through).
+// Both happen before any byte is written. Writes that are not client deploys
+// opt out with WithoutWritePolicy.
 func StoreArtifact(ctx context.Context, d formats.Deps,
 	repoName, filePath, contentType string,
 	coords Coords,
@@ -91,66 +101,22 @@ func StoreArtifact(ctx context.Context, d formats.Deps,
 		return nil, err
 	}
 
-	// Stream → hash writers → blob store via pipe
-	sha256h := sha256.New()
-	sha1h := sha1.New() //nolint:gosec // protocol checksum, not security
-	md5h := md5.New()   //nolint:gosec // protocol checksum, not security
-
-	pr, pw := io.Pipe()
-	// The copier reports how many bytes it actually moved, so the size recorded
-	// in the DB is never the caller's declaration taken on faith.
-	copied := make(chan int64, 1)
-	go func() {
-		n, err := io.Copy(io.MultiWriter(pw, sha256h, sha1h, md5h), reader)
-		pw.CloseWithError(err)
-		copied <- n
-	}()
-
-	putErr := physStore.Put(ctx, blobKey, pr, declaredSize)
-	// Unblocks the copier if the store stopped reading before EOF; a no-op once
-	// the pipe has drained on its own. Receiving the count then also orders the
-	// hash writers' final state against this goroutine.
-	_ = pr.Close()
-	written := <-copied
-	if putErr != nil {
-		return nil, fmt.Errorf("store blob: %w", putErr)
-	}
-
-	sha256sum := hex.EncodeToString(sha256h.Sum(nil))
-	sha1sum := hex.EncodeToString(sha1h.Sum(nil))
-	md5sum := hex.EncodeToString(md5h.Sum(nil))
-
-	size := declaredSize
-	if size <= 0 {
-		if s, err := physStore.Size(ctx, blobKey); err == nil {
-			size = s
-		}
-	} else if written != declaredSize {
-		// A body shorter (or longer) than its own declared length: recording the
-		// declaration would register a component whose stored size and checksum
-		// describe different bytes, and every later download would announce a
-		// Content-Length it then fails to deliver.
-		_ = physStore.Delete(ctx, blobKey)
-		return nil, fmt.Errorf("%w: declared %d, received %d", ErrSizeMismatch, declaredSize, written)
-	}
-
-	// Post-write quota check covers streaming uploads where size wasn't declared.
-	if size > 0 && declaredSize <= 0 {
-		if err := checkQuota(ctx, d, repo, size); err != nil {
-			_ = physStore.Delete(ctx, blobKey)
-			return nil, err
-		}
-	}
-
-	asset, err := RegisterStoredBlob(ctx, d, repo, filePath, contentType, coords, blobKey, sha256sum, sha1sum, md5sum, size, resolvedBlobStoreID, resolvedBlobStoreName)
+	var (
+		asset                      *domain.Asset
+		sha256sum, sha1sum, md5sum string
+		size                       int64
+	)
+	// The policy check has to come before Put: the blob key is derived from
+	// the path, not the content, so a write refused afterwards would already
+	// have replaced the original bytes.
+	err = enforceWritePolicy(ctx, d, repo, filePath, blobKey, func(ctx context.Context) error {
+		var werr error
+		asset, sha256sum, sha1sum, md5sum, size, werr = writeAndRegister(ctx, d, repo,
+			filePath, contentType, coords, reader, declaredSize,
+			blobKey, resolvedBlobStoreID, resolvedBlobStoreName, physStore)
+		return werr
+	})
 	if err != nil {
-		// A registration the quota refused leaves bytes nothing references; drop
-		// them unless another asset legitimately shares the key.
-		if errors.Is(err, ErrQuotaExceeded) {
-			if others, cerr := d.Assets.CountByBlobKey(ctx, blobKey, ""); cerr == nil && others == 0 {
-				_ = physStore.Delete(ctx, blobKey)
-			}
-		}
 		return nil, err
 	}
 
@@ -180,6 +146,78 @@ func StoreArtifact(ctx context.Context, d formats.Deps,
 		MD5:    md5sum,
 		Size:   size,
 	}, nil
+}
+
+// writeAndRegister streams reader to blobKey while hashing it, then registers
+// the asset — StoreArtifact's write half, which runs under the write policy.
+func writeAndRegister(ctx context.Context, d formats.Deps, repo *domain.Repository,
+	filePath, contentType string, coords Coords,
+	reader io.Reader, declaredSize int64,
+	blobKey, resolvedBlobStoreID, resolvedBlobStoreName string, physStore storage.BlobStore,
+) (asset *domain.Asset, sha256sum, sha1sum, md5sum string, size int64, err error) {
+	// Stream → hash writers → blob store via pipe
+	sha256h := sha256.New()
+	sha1h := sha1.New() //nolint:gosec // protocol checksum, not security
+	md5h := md5.New()   //nolint:gosec // protocol checksum, not security
+
+	pr, pw := io.Pipe()
+	// The copier reports how many bytes it actually moved, so the size recorded
+	// in the DB is never the caller's declaration taken on faith.
+	copied := make(chan int64, 1)
+	go func() {
+		n, err := io.Copy(io.MultiWriter(pw, sha256h, sha1h, md5h), reader)
+		pw.CloseWithError(err)
+		copied <- n
+	}()
+
+	putErr := physStore.Put(ctx, blobKey, pr, declaredSize)
+	// Unblocks the copier if the store stopped reading before EOF; a no-op once
+	// the pipe has drained on its own. Receiving the count then also orders the
+	// hash writers' final state against this goroutine.
+	_ = pr.Close()
+	written := <-copied
+	if putErr != nil {
+		return nil, "", "", "", 0, fmt.Errorf("store blob: %w", putErr)
+	}
+
+	sha256sum = hex.EncodeToString(sha256h.Sum(nil))
+	sha1sum = hex.EncodeToString(sha1h.Sum(nil))
+	md5sum = hex.EncodeToString(md5h.Sum(nil))
+
+	size = declaredSize
+	if size <= 0 {
+		if s, err := physStore.Size(ctx, blobKey); err == nil {
+			size = s
+		}
+	} else if written != declaredSize {
+		// A body shorter (or longer) than its own declared length: recording the
+		// declaration would register a component whose stored size and checksum
+		// describe different bytes, and every later download would announce a
+		// Content-Length it then fails to deliver.
+		_ = physStore.Delete(ctx, blobKey)
+		return nil, "", "", "", 0, fmt.Errorf("%w: declared %d, received %d", ErrSizeMismatch, declaredSize, written)
+	}
+
+	// Post-write quota check covers streaming uploads where size wasn't declared.
+	if size > 0 && declaredSize <= 0 {
+		if err := checkQuota(ctx, d, repo, size); err != nil {
+			_ = physStore.Delete(ctx, blobKey)
+			return nil, "", "", "", 0, err
+		}
+	}
+
+	asset, err = RegisterStoredBlob(ctx, d, repo, filePath, contentType, coords, blobKey, sha256sum, sha1sum, md5sum, size, resolvedBlobStoreID, resolvedBlobStoreName)
+	if err != nil {
+		// A registration the quota refused leaves bytes nothing references; drop
+		// them unless another asset legitimately shares the key.
+		if errors.Is(err, ErrQuotaExceeded) {
+			if others, cerr := d.Assets.CountByBlobKey(ctx, blobKey, ""); cerr == nil && others == 0 {
+				_ = physStore.Delete(ctx, blobKey)
+			}
+		}
+		return nil, "", "", "", 0, err
+	}
+	return asset, sha256sum, sha1sum, md5sum, size, nil
 }
 
 // RegisterStoredBlob upserts component + asset after a blob was written to blobKey with known checksums.
@@ -308,8 +346,90 @@ func RegisterStoredBlob(ctx context.Context, d formats.Deps, repo *domain.Reposi
 		return nil, err
 	}
 
+	// Publish first, scan second: an auto-promotion that requires a scan only
+	// accepts one that started no earlier than the publish it records, and a
+	// scan worker picking the component up the instant it is queued must not
+	// beat that timestamp.
+	notifyPublished(ctx, d, repo, comp, filePath, coords)
 	queueForScanning(d, comp)
 	return asset, nil
+}
+
+// notifyPublished tells auto-promotion (#542) that a client published into
+// comp. Like queueForScanning it sits at the narrow waist, and it filters to
+// what a promotion rule should react to:
+//
+//   - hosted repositories only — a proxy caching an upstream file is not a
+//     publish, and a group write lands in (and is registered against) its
+//     hosted member;
+//   - client writes only — a Nexus migration bringing content across
+//     (WithoutWritePolicy) is not a publish either. Promotion's own copies do
+//     not come through here at all, so a promoted copy never starts a rule on
+//     the target repository: there are no auto-promotion chains, and so no
+//     cycles;
+//   - for Docker/OCI, a manifest pushed by tag. Layers, configs and manifests
+//     pushed by digest are parts of an image, not a release — a client pushes
+//     them before the tag, and the promotion of the tag brings them along
+//     (#541). Triggering on them would start a promotion per blob;
+//   - no index or side files (IsPublishSideFile): a file with no package
+//     coordinates, or a format's own index such as maven-metadata.xml, is not
+//     a release — promoting one would plant the source's index in the target
+//     over the one the target generates from its own contents.
+func notifyPublished(ctx context.Context, d formats.Deps, repo *domain.Repository, comp *domain.Component, filePath string, coords Coords) {
+	if d.Publishes == nil || comp == nil || comp.ID == "" || repo == nil {
+		return
+	}
+	if repo.Type != domain.TypeHosted || writePolicyBypassed(ctx) {
+		return
+	}
+	if repo.Format.IsOCIRegistry() && !isOCITagManifestPath(filePath) {
+		return
+	}
+	if coords.Name == "" || IsPublishSideFile(repo.Format, filePath) || metadataPlaceholderVersions[coords.Version] {
+		return
+	}
+	d.Publishes.NotifyPublished(ctx, repo.Name, comp.ID)
+}
+
+// metadataPlaceholderVersions are the version labels handlers register index
+// documents under (an npm packument, a PyPI simple page, a Cargo index entry):
+// files, not package versions. The scan service skips the same set.
+var metadataPlaceholderVersions = map[string]bool{
+	"metadata":    true,
+	"simple-page": true,
+	"index":       true,
+}
+
+// IsPublishSideFile reports whether filePath is a format's index or checksum
+// file rather than part of a release: maven-metadata.xml at any level and
+// checksum sidecars of any file. The repository regenerates these from its own
+// contents, so neither triggers nor travels with an automatic promotion.
+func IsPublishSideFile(format domain.RepoFormat, filePath string) bool {
+	if format != domain.FormatMaven2 {
+		return false
+	}
+	p := filePath
+	for _, ext := range []string{".sha1", ".md5", ".sha256", ".sha512"} {
+		p = strings.TrimSuffix(p, ext)
+	}
+	if path.Base(p) == "maven-metadata.xml" {
+		return true
+	}
+	return p != filePath
+}
+
+// isOCITagManifestPath reports whether filePath is "/manifests/<image>/<tag>"
+// with a tag reference rather than a digest.
+func isOCITagManifestPath(filePath string) bool {
+	rest, ok := strings.CutPrefix(filePath, "/manifests/")
+	if !ok {
+		return false
+	}
+	i := strings.LastIndex(rest, "/")
+	if i <= 0 || i == len(rest)-1 {
+		return false
+	}
+	return !strings.Contains(rest[i+1:], ":")
 }
 
 // storeQuotaConfigured reports whether the store this registration lands in has

@@ -54,6 +54,35 @@ func setupProxyWithIndexTTL(t *testing.T, repoName, remoteURL string, indexTTL t
 	return r, comps
 }
 
+// setupGroupMemberProxy is setupProxy with GroupMemberKey set, as the group
+// fan-out does when it asks a member for a chart.
+func setupGroupMemberProxy(t *testing.T, repoName, remoteURL string) (*gin.Engine, *testutil.ComponentRepo) {
+	t.Helper()
+	comps := testutil.NewComponentRepo()
+	repo := &domain.Repository{
+		ID: repoName, Name: repoName, Format: "helm",
+		Type: domain.TypeProxy, Online: true,
+		ProxyConfig: map[string]any{"remote_url": remoteURL},
+	}
+	d := formats.Deps{
+		Repos:      testutil.NewRepoRepo(repo),
+		Blobs:      testutil.NewBlobStoreRepo(),
+		Components: comps,
+		Assets:     testutil.NewAssetRepo(),
+		BlobStore:  testutil.NewBlobStore(),
+		BaseURL:    testBaseURL,
+
+		HelmIndexCacheTTL: 5 * time.Minute,
+	}
+	h := helm.New(d)
+	r := gin.New()
+	r.Any("/repository/:repoName/*path", func(c *gin.Context) {
+		c.Set(formats.GroupMemberKey, true)
+		h.ServeHTTP(c)
+	})
+	return r, comps
+}
+
 // nestedUpstream serves an index.yaml whose single entry URL is entryURL, plus the
 // chart tarball at tgzPath.
 func nestedUpstream(t *testing.T, entryURL, tgzPath, body string) *httptest.Server {
@@ -224,9 +253,9 @@ func TestHelm_Proxy_AbsoluteURLForeignHost_RoundTrip(t *testing.T) {
 
 // TestHelm_Proxy_ForeignHostNonCanonicalFilename_RoundTrip: an off-host origin is
 // free to be named anything ("widget.tgz", "widget-v1.0.0.tgz" for version
-// "1.0.0"). Since the GET recovers the origin by splitting the filename back into
-// chart coordinates, the index rewrite mints the entry's own name — proxying the
-// origin's basename instead made the lookup miss and answered 404.
+// "1.0.0"). The GET recovers the origin by the rewritten local path, so the
+// index rewrite mints the entry's own name — proxying the origin's basename
+// instead collided with any other widget.tgz and filed version 0.0.0.
 func TestHelm_Proxy_ForeignHostNonCanonicalFilename_RoundTrip(t *testing.T) {
 	for _, tc := range []struct{ name, originFile string }{
 		{"no version in the file name", "widget.tgz"},
@@ -276,6 +305,60 @@ func TestHelm_Proxy_ForeignHostNonCanonicalFilename_RoundTrip(t *testing.T) {
 			require.Len(t, page.Items, 1)
 			assert.Equal(t, "widget", page.Items[0].Name)
 			assert.Equal(t, "1.0.0", page.Items[0].Version)
+		})
+	}
+}
+
+// TestHelm_Proxy_SameHostNonCanonicalFilename_RoundTrip: a same-host index URL
+// keeps its original path (charts/widget.tgz, ingress-nginx-v4.11.2.tgz). The
+// origin lookup is keyed by that rewritten path, not by splitChartFilename, so
+// neither shape 404s.
+func TestHelm_Proxy_SameHostNonCanonicalFilename_RoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		name, chart, version, entryURL, tgzPath string
+	}{
+		{"subdirectory basename without version", "widget", "1.0.0",
+			"charts/widget.tgz", "/charts/widget.tgz"},
+		{"v-prefixed version in the file name", "ingress-nginx", "4.11.2",
+			"ingress-nginx-v4.11.2.tgz", "/ingress-nginx-v4.11.2.tgz"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/index.yaml":
+					w.Header().Set("Content-Type", "application/yaml")
+					_, _ = w.Write([]byte("apiVersion: v1\n" +
+						"entries:\n" +
+						"  " + tc.chart + ":\n" +
+						"  - name: " + tc.chart + "\n" +
+						"    version: \"" + tc.version + "\"\n" +
+						"    urls:\n" +
+						"    - " + tc.entryURL + "\n"))
+				case tc.tgzPath:
+					w.Header().Set("Content-Type", "application/x-tar")
+					_, _ = w.Write([]byte("samehost-chart-bytes"))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer upstream.Close()
+
+			r, comps := setupProxy(t, "helm-samehost", upstream.URL)
+
+			chartURL := firstChartURL(t, r, "helm-samehost")
+			assert.Equal(t, testBaseURL+"/repository/helm-samehost"+tc.tgzPath, chartURL)
+
+			req := httptest.NewRequest(http.MethodGet, strings.TrimPrefix(chartURL, testBaseURL), nil)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+			assert.Equal(t, "samehost-chart-bytes", w.Body.String())
+
+			page, err := comps.List(t.Context(), "helm-samehost", 100, 0)
+			require.NoError(t, err)
+			require.Len(t, page.Items, 1)
+			assert.Equal(t, tc.chart, page.Items[0].Name)
+			assert.Equal(t, tc.version, page.Items[0].Version)
 		})
 	}
 }
@@ -496,9 +579,9 @@ func TestHelm_Proxy_NestedChart_CachedCoords(t *testing.T) {
 	assert.Equal(t, "4.11.2", page.Items[0].Version)
 }
 
-// TestHelm_Proxy_UnknownChartInIndexIsNotFound: a readable index that does not
-// list this chart must 404 without asking upstream for the tarball (Bitnami's
-// S3 would 403, which used to stop group fan-out).
+// TestHelm_Proxy_UnknownChartInIndexIsNotFound: a group member whose readable
+// index does not list this chart must 404 without asking upstream for the
+// tarball (Bitnami's S3 would 403, which used to stop group fan-out).
 func TestHelm_Proxy_UnknownChartInIndexIsNotFound(t *testing.T) {
 	hitTgz := false
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -514,12 +597,41 @@ func TestHelm_Proxy_UnknownChartInIndexIsNotFound(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	r, _ := setupProxy(t, "helm-bitnami", upstream.URL)
+	r, _ := setupGroupMemberProxy(t, "helm-bitnami", upstream.URL)
 	req := httptest.NewRequest(http.MethodGet, "/repository/helm-bitnami/cilium-1.16.0.tgz", nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
 	assert.False(t, hitTgz, "must not fetch a chart the index does not list")
+}
+
+// TestHelm_Proxy_UnlistedChartDirectForwards: addressed directly, an unlisted
+// chart is forwarded as a path. Some remotes serve versions the index omits
+// (trimmed catalogs, Non-SemVer names); a 404 here would hide them.
+func TestHelm_Proxy_UnlistedChartDirectForwards(t *testing.T) {
+	hitTgz := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/index.yaml":
+			w.Header().Set("Content-Type", "application/yaml")
+			_, _ = w.Write([]byte("apiVersion: v1\nentries:\n  redis:\n    - name: redis\n      version: \"1.0.0\"\n      urls:\n        - redis-1.0.0.tgz\n"))
+		case "/cilium-1.16.0.tgz":
+			hitTgz = true
+			w.Header().Set("Content-Type", "application/x-tar")
+			_, _ = w.Write([]byte("unlisted-but-there"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	r, _ := setupProxy(t, "helm-direct", upstream.URL)
+	req := httptest.NewRequest(http.MethodGet, "/repository/helm-direct/cilium-1.16.0.tgz", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.True(t, hitTgz, "direct request must path-forward an unlisted chart")
+	assert.Equal(t, "unlisted-but-there", w.Body.String())
 }
 
 // TestHelm_Proxy_UpstreamForbiddenStaysForbidden: a 403 is mapped to a miss only

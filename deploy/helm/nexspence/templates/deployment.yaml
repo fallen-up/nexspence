@@ -99,7 +99,7 @@ spec:
                   name: {{ .Values.config.jwtSecretExistingSecret }}
                   key: {{ .Values.config.jwtSecretExistingSecretKey | default "jwt-secret" }}
             {{- end }}
-            {{- if .Values.config.adminExistingSecret }}
+            {{- if and .Values.config.bootstrapEnabled .Values.config.adminExistingSecret }}
             - name: NEXSPENCE_BOOTSTRAP_ADMIN_USERNAME
               valueFrom:
                 secretKeyRef:

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
@@ -95,6 +94,9 @@ func (s *RepositoryService) Create(ctx context.Context, r *domain.Repository) er
 	if err := validateNameForFormat(r.Name, r.Format); err != nil {
 		return err
 	}
+	if err := validateWritePolicy(r); err != nil {
+		return err
+	}
 
 	// Check duplicate
 	existing, err := s.repos.Get(ctx, r.Name)
@@ -176,6 +178,12 @@ func (s *RepositoryService) Update(ctx context.Context, name string, updates *do
 		r.Description = updates.Description
 	}
 	if updates.FormatConfig != nil {
+		// Validated before it is applied, so a refused update leaves r as read.
+		candidate := *r
+		candidate.FormatConfig = updates.FormatConfig
+		if err := validateWritePolicy(&candidate); err != nil {
+			return nil, err
+		}
 		r.FormatConfig = updates.FormatConfig
 	}
 	if updates.HTTPConfig != nil {
@@ -265,6 +273,38 @@ func (s *RepositoryService) Update(ctx context.Context, name string, updates *do
 	return r, nil
 }
 
+// validateWritePolicy checks the write-policy keys of formatConfig (#539).
+// write_policy must be one of allow / allow_once / deny, and anything but
+// allow is refused on a proxy or group: neither takes client deploys of its
+// own, so a stricter policy there would read as protection that does nothing.
+// allow_redeploy_latest must be a boolean and can only be switched on for a
+// docker/oci repository, the formats that have a "latest" tag.
+func validateWritePolicy(r *domain.Repository) error {
+	if r.FormatConfig == nil {
+		return nil
+	}
+	if raw, ok := r.FormatConfig[domain.WritePolicyKey]; ok && raw != nil {
+		v, isStr := raw.(string)
+		p := domain.WritePolicy(v)
+		if !isStr || !p.Valid() {
+			return fmt.Errorf("%w: %s must be one of allow, allow_once, deny", ErrInvalidInput, domain.WritePolicyKey)
+		}
+		if p != domain.WritePolicyAllow && r.Type != domain.TypeHosted {
+			return fmt.Errorf("%w: %s applies to hosted repositories only", ErrInvalidInput, domain.WritePolicyKey)
+		}
+	}
+	if raw, ok := r.FormatConfig[domain.AllowRedeployLatestKey]; ok && raw != nil {
+		v, isBool := raw.(bool)
+		if !isBool {
+			return fmt.Errorf("%w: %s must be a boolean", ErrInvalidInput, domain.AllowRedeployLatestKey)
+		}
+		if v && (r.Type != domain.TypeHosted || !r.Format.IsOCIRegistry()) {
+			return fmt.Errorf("%w: %s applies to hosted docker and oci repositories only", ErrInvalidInput, domain.AllowRedeployLatestKey)
+		}
+	}
+	return nil
+}
+
 // mergeProxyConfig produces the proxyConfig to persist from the stored one and the
 // caller's replacement. The replacement wins wholesale, except for the secrets:
 // clients read a redacted config (see domain.RedactedRepository), so an omitted
@@ -298,14 +338,6 @@ func mergeProxyConfig(stored, updates map[string]any) map[string]any {
 	return merged
 }
 
-// dockerPathComponent is the distribution reference grammar for one path
-// component. Docker-family clients parse image references with it, so a
-// docker/oci repository whose name fails it exists but can never be pushed to
-// or pulled from — `docker tag host/<name>/img` is not even parseable. (#262
-// was found via a repository named "docker test", created without complaint
-// and then silently unusable.)
-var dockerPathComponent = regexp.MustCompile(`^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*$`)
-
 // reservedV2Names are the static routes registered under /v2/ (see
 // internal/api/router.go). Gin matches a static segment before the
 // /v2/:repoName parameter, so a repository named after one is created
@@ -326,7 +358,7 @@ func validateNameForFormat(name string, format domain.RepoFormat) error {
 	if !format.IsOCIRegistry() {
 		return nil
 	}
-	if !dockerPathComponent.MatchString(name) {
+	if !domain.IsDockerPathComponent(name) {
 		return fmt.Errorf(
 			"%w: %q cannot be addressed by docker clients — use lowercase letters and digits, "+
 				"joined by '.', '_' or '-' (e.g. \"docker-test\")",

@@ -3,6 +3,8 @@ package api
 import (
 	"net/http"
 	"strings"
+
+	"github.com/nexspence-oss/nexspence/internal/domain"
 )
 
 // SubdomainRewriter is an http.Handler wrapper that rewrites Docker /v2/* paths
@@ -28,15 +30,15 @@ type SubdomainRewriter struct {
 // baseDomain must NOT have a leading dot (e.g. "nexspence.example.com").
 // aliases maps full client hostnames to repository names; alias hostnames do
 // not have to sit under baseDomain, and an alias for "<sub>.<baseDomain>"
-// overrides the implicit "<sub>" repository. Alias targets that are not valid
-// repository name labels are ignored — the value is spliced into a URL path,
+// overrides the implicit "<sub>" repository. Alias targets that no docker
+// repository could be named are ignored — the value is spliced into a URL path,
 // and a config typo must not become a path injection.
 func NewSubdomainRewriter(next http.Handler, baseDomain string, aliases map[string]string) http.Handler {
 	m := make(map[string]string, len(aliases))
 	for host, repo := range aliases {
 		host = strings.ToLower(strings.TrimSpace(host))
 		repo = strings.TrimSpace(repo)
-		if host == "" || !isRepoNameLabel(repo) {
+		if host == "" || !domain.IsDockerPathComponent(repo) {
 			continue
 		}
 		m[host] = repo

@@ -243,6 +243,20 @@ type CleanupPolicyRepo interface {
 	Delete(ctx context.Context, id string) error
 }
 
+// BackupSettingsRepo persists the singleton scheduled-backup config (spec 37).
+type BackupSettingsRepo interface {
+	// Get always returns a value — the column defaults when the singleton row
+	// has never been written (Enabled=false, so a fresh instance never backs
+	// up until an admin opts in).
+	Get(ctx context.Context) (*domain.BackupSettings, error)
+	// Upsert replaces the editable fields (enabled, scheduleCron, blobStoreId,
+	// retentionCount). Leaves LastRun* untouched — edited via RecordRun only,
+	// so saving the form never wipes run history.
+	Upsert(ctx context.Context, s *domain.BackupSettings) error
+	// RecordRun persists the outcome of a scheduled run. runErr empty means success.
+	RecordRun(ctx context.Context, at time.Time, key, runErr string) error
+}
+
 // AuditQuery holds filter and pagination parameters for AuditRepo.List/Stream.
 type AuditQuery struct {
 	Domain   string     // empty = any
@@ -379,6 +393,65 @@ type PromotionRepo interface {
 	// leaves the row untouched.
 	WithPendingRequestLock(ctx context.Context, id string,
 		fn func(ctx context.Context, req *domain.PromotionRequest) PromotionOutcome) error
+	// CreateAutoRequest files a request made by auto-promotion (#542): no
+	// requester, Automatic set, and the status/error/completed_at req carries.
+	// At most one automatic request per (rule, component) may be pending: when
+	// req is pending and one already is, nothing is inserted, req is filled
+	// from the existing row and created is false.
+	CreateAutoRequest(ctx context.Context, req *domain.PromotionRequest) (created bool, err error)
+	// FailPendingAutoRequests settles the pending automatic request of
+	// (ruleID, componentID), if any, as failed with reason — a later publish
+	// of the component was blocked, so what it asks to promote is no longer
+	// what it would copy. Returns how many it settled.
+	FailPendingAutoRequests(ctx context.Context, ruleID, componentID, reason string) (int, error)
+}
+
+// AutoPromotionQueueRepo is the durable queue behind auto-promotion on publish
+// (#542): one row per (auto_promote rule, component) waiting to be evaluated.
+// Rows are claimed with a lease and a claim token, so several replicas can
+// drain it without two of them working the same row, and a worker whose lease
+// ran out cannot overwrite the state of the one that claimed the row next. A
+// publish into a component that is being evaluated is never lost: it bumps the
+// row's generation, and the worker only removes the generation it evaluated.
+//
+// Scheduling (due_at, leases) runs on the database clock; publish times are
+// the caller's, and only ever move forward.
+type AutoPromotionQueueRepo interface {
+	// EnqueuePublish records that componentID, in repository fromRepo, received
+	// an asset at publishedAt: every auto_promote rule promoting from fromRepo
+	// gets (or refreshes) a row due settle from now. Returns how many rows it
+	// touched.
+	EnqueuePublish(ctx context.Context, fromRepo, componentID string, publishedAt time.Time, settle time.Duration) (int, error)
+	// Claim leases up to limit due rows for lease, each under a new token.
+	Claim(ctx context.Context, lease time.Duration, limit int) ([]domain.AutoPromotionEntry, error)
+	// Finish removes the claimed row if no publish arrived since the claim (the
+	// generation still matches), and otherwise just releases the claim. It
+	// does nothing when the claim is no longer e's.
+	Finish(ctx context.Context, e domain.AutoPromotionEntry) error
+	// Retry releases the claim and, if no publish arrived since it, schedules
+	// the row again as r says. It does nothing when the claim is no longer e's.
+	Retry(ctx context.Context, e domain.AutoPromotionEntry, r AutoPromotionRetry) error
+	// WakeForScan makes the component's rows that wait for a scan due now.
+	WakeForScan(ctx context.Context, componentID string) error
+	// Queued reports whether a row for (ruleID, componentID) is waiting — a
+	// publish the worker has not evaluated yet.
+	Queued(ctx context.Context, ruleID, componentID string) (bool, error)
+	// List returns every queued row, oldest due first.
+	List(ctx context.Context) ([]domain.AutoPromotionEntry, error)
+}
+
+// AutoPromotionRetry is how a claimed row is rescheduled.
+type AutoPromotionRetry struct {
+	// DueIn is how long from now the row is next due.
+	DueIn time.Duration
+	// WaitingForScan lets a finished scan wake the row early.
+	WaitingForScan bool
+	// Started records that this generation's start was audited.
+	Started bool
+	// CountAttempt counts a transient failure toward giving up; waiting for
+	// the settle window or a scan does not.
+	CountAttempt bool
+	Reason       string
 }
 
 // PromotionOutcome is what a WithPendingRequestLock callback decides about the

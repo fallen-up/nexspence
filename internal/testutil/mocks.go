@@ -26,6 +26,7 @@ var (
 	_ repository.ComponentRepo          = (*ComponentRepo)(nil)
 	_ repository.AssetRepo              = (*AssetRepo)(nil)
 	_ repository.CleanupPolicyRepo      = (*CleanupPolicyRepo)(nil)
+	_ repository.BackupSettingsRepo     = (*BackupSettingsRepo)(nil)
 	_ repository.AuditRepo              = (*AuditRepo)(nil)
 	_ repository.UserRepo               = (*UserRepo)(nil)
 	_ repository.RoleRepo               = (*RoleRepo)(nil)
@@ -1308,6 +1309,64 @@ func (r *CleanupPolicyRepo) RecordRun(_ context.Context, id string, at time.Time
 		p.LastRunCount = count
 		p.LastRunFreed = freed
 	}
+	return nil
+}
+
+// ── BackupSettingsRepo ────────────────────────────────────────
+
+type BackupSettingsRepo struct {
+	mu       sync.Mutex
+	settings *domain.BackupSettings // nil until first Upsert/RecordRun, matching "row never written"
+	Err      error
+}
+
+func NewBackupSettingsRepo() *BackupSettingsRepo {
+	return &BackupSettingsRepo{}
+}
+
+func (r *BackupSettingsRepo) Get(_ context.Context) (*domain.BackupSettings, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.Err != nil {
+		return nil, r.Err
+	}
+	if r.settings == nil {
+		return &domain.BackupSettings{ScheduleCron: "0 3 * * *", RetentionCount: 7}, nil
+	}
+	cp := *r.settings
+	return &cp, nil
+}
+
+func (r *BackupSettingsRepo) Upsert(_ context.Context, s *domain.BackupSettings) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.Err != nil {
+		return r.Err
+	}
+	cp := *s
+	if r.settings != nil {
+		// Upsert never touches LastRun*, matching the real repo's contract.
+		cp.LastRunAt = r.settings.LastRunAt
+		cp.LastRunKey = r.settings.LastRunKey
+		cp.LastRunError = r.settings.LastRunError
+	}
+	r.settings = &cp
+	return nil
+}
+
+func (r *BackupSettingsRepo) RecordRun(_ context.Context, at time.Time, key, runErr string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.Err != nil {
+		return r.Err
+	}
+	if r.settings == nil {
+		r.settings = &domain.BackupSettings{ScheduleCron: "0 3 * * *", RetentionCount: 7}
+	}
+	t := at
+	r.settings.LastRunAt = &t
+	r.settings.LastRunKey = key
+	r.settings.LastRunError = runErr
 	return nil
 }
 func (r *CleanupPolicyRepo) Delete(_ context.Context, id string) error {
@@ -2837,6 +2896,51 @@ func (r *PromotionRepo) WithPendingRequestLock(ctx context.Context, id string,
 	req.CompletedAt = outcome.CompletedAt
 	req.Error = outcome.Error
 	return nil
+}
+
+// CreateAutoRequest mirrors the postgres partial unique index: one pending
+// automatic request per (rule, component).
+func (r *PromotionRepo) CreateAutoRequest(_ context.Context, req *domain.PromotionRequest) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	req.Automatic = true
+	req.RequestedBy = ""
+	if req.Status == domain.PromotionPending {
+		for _, v := range r.Requests {
+			if v.Automatic && v.Status == domain.PromotionPending &&
+				v.RuleID == req.RuleID && v.ComponentID == req.ComponentID {
+				if req.PublishedAt != nil && (v.PublishedAt == nil || req.PublishedAt.After(*v.PublishedAt)) {
+					t := *req.PublishedAt
+					v.PublishedAt = &t
+				}
+				*req = *v
+				return false, nil
+			}
+		}
+	}
+	req.ID = r.genID()
+	req.CreatedAt = time.Now()
+	cp := *req
+	r.Requests[req.ID] = &cp
+	return true, nil
+}
+
+// FailPendingAutoRequests mirrors the postgres UPDATE of the pair's pending
+// automatic request.
+func (r *PromotionRepo) FailPendingAutoRequests(_ context.Context, ruleID, componentID, reason string) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	now := time.Now()
+	for _, v := range r.Requests {
+		if v.Automatic && v.Status == domain.PromotionPending && v.RuleID == ruleID && v.ComponentID == componentID {
+			v.Status = domain.PromotionFailed
+			v.Error = reason
+			v.CompletedAt = &now
+			n++
+		}
+	}
+	return n, nil
 }
 
 // PutBytes is a test helper that stores raw bytes under key in the BlobStore mock.

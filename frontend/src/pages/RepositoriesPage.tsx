@@ -2,13 +2,15 @@ import { useState } from 'react'
 import * as React from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Database, Download, Plus, Trash2, RefreshCw, Settings2, Power } from 'lucide-react'
+import { Database, Download, Plus, Trash2, RefreshCw, Settings2, Power, Terminal } from 'lucide-react'
 import { nexusApi, nexspenceApi, apiClient, apiErrorMessage, BlobStoreMigration, startBlobStoreMigration, getBlobStoreMigration, cancelBlobStoreMigration, RoutingRule } from '@/api/client'
 import { useAuthStore } from '@/store/authStore'
 import styles from './RepositoriesPage.module.css'
 import { Select } from '../components/Select'
 import { HoloButton, HoloInput, HoloPill, HoloModal, Wizard } from '@/components/holo'
 import { Truncated } from '@/components/Truncated'
+import { tint } from '@/theme/color'
+import { SetMeUpDialog } from '@/components/SetMeUpDialog'
 
 interface Repository {
   id: string
@@ -57,23 +59,23 @@ function cleanupPoliciesForFormat(policies: CleanupPolicyRow[], format: string) 
 }
 
 const FORMAT_COLORS: Record<string, string> = {
-  maven2:    '#f97316',
-  npm:       '#ef4444',
-  docker:    '#3b82f6',
-  oci:       '#5b8def',
-  pypi:      '#a78bfa',
-  go:        '#06b6d4',
-  nuget:     '#8b5cf6',
-  helm:      '#0ea5e9',
-  raw:       '#6b7280',
-  apt:       '#f59e0b',
-  yum:       '#10b981',
-  conda:     '#44b765',
-  rubygems:  '#e9573f',
+  maven2:    'var(--holo-c-orange)',
+  npm:       'var(--holo-c-red)',
+  docker:    'var(--holo-c-blue)',
+  oci:       'var(--holo-c-blue-oci)',
+  pypi:      'var(--holo-c-violet-400)',
+  go:        'var(--holo-c-cyan)',
+  nuget:     'var(--holo-c-violet-500)',
+  helm:      'var(--holo-c-sky)',
+  raw:       'var(--holo-c-gray)',
+  apt:       'var(--holo-c-amber)',
+  yum:       'var(--holo-c-emerald)',
+  conda:     'var(--holo-c-green-conda)',
+  rubygems:  'var(--holo-c-red-ruby)',
   terraform: '#7b42bc',
   cran:      '#276dc3',
   alpine:    '#0d597f',
-  huggingface: '#ffd21e',
+  huggingface: 'var(--holo-c-yellow)',
 }
 
 const TYPE_LABELS: Record<string, string> = {
@@ -99,6 +101,7 @@ export default function RepositoriesPage() {
   const [typeFilter, setTypeFilter] = useState('')
   const [showCreate, setShowCreate] = useState(false)
   const [editRepo, setEditRepo] = useState<Repository | null>(null)
+  const [setupRepo, setSetupRepo] = useState<Repository | null>(null)
   const [activeMigrations, setActiveMigrations] = React.useState<Set<string>>(new Set())
 
   const { data: repos = [], isLoading, isError, error, refetch } = useQuery<Repository[]>({
@@ -155,7 +158,7 @@ export default function RepositoriesPage() {
         <div className="holo-section-label" style={{ marginBottom: 4 }}>WORKSPACE / REPOSITORIES</div>
         <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', gap: 16 }}>
           <div>
-            <h1 style={{ fontSize: 20, fontWeight: 700, margin: '0 0 3px', letterSpacing: '-0.01em', lineHeight: 1.2, background: 'linear-gradient(110deg, #7c5cff, #22d3ee 60%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' as const }}>Repositories</h1>
+            <h1 style={{ fontSize: 20, fontWeight: 700, margin: '0 0 3px', letterSpacing: '-0.01em', lineHeight: 1.2, background: 'linear-gradient(110deg, var(--holo-a), var(--holo-b) 60%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' as const }}>Repositories</h1>
             <p style={{ fontSize: 12, color: 'var(--holo-text-faint)', margin: 0 }}>{repos.length} total</p>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -206,7 +209,7 @@ export default function RepositoriesPage() {
       ) : isError ? (
         <div className={styles.empty}>
           <Database size={40} className={styles.emptyIcon} />
-          <p style={{ color: '#ef4444', marginBottom: 8 }}>Error loading repositories</p>
+          <p style={{ color: 'var(--holo-c-red)', marginBottom: 8 }}>Error loading repositories</p>
           <p style={{ fontSize: 13, color: 'var(--holo-text-dim)', marginBottom: 16 }}>
             {error instanceof Error ? error.message : 'Unable to access repositories. Check your permissions or contact your administrator.'}
           </p>
@@ -243,6 +246,7 @@ export default function RepositoriesPage() {
               migrating={activeMigrations.has(repo.name)}
               onClick={() => navigate(`/browse?repo=${repo.name}`)}
               onEdit={() => setEditRepo(repo)}
+              onSetMeUp={() => setSetupRepo(repo)}
               onDelete={() => {
                 if (confirm(`Delete repository "${repo.name}"?`)) {
                   deleteMutation.mutate(repo.name)
@@ -278,11 +282,14 @@ export default function RepositoriesPage() {
         />
       )}
 
+      <SetMeUpDialog repo={setupRepo} onClose={() => setSetupRepo(null)} />
+
       {editRepo && (
         <EditRepoModal
           key={editRepo.id}
           repo={editRepo}
           onClose={() => setEditRepo(null)}
+          onSetMeUp={() => { setSetupRepo(editRepo); setEditRepo(null) }}
           onSaved={() => {
             qc.invalidateQueries({ queryKey: ['repositories'] })
             setEditRepo(null)
@@ -312,7 +319,7 @@ function formatBytes(bytes: number): string {
 }
 
 function RepoRow({
-  repo, isAdmin, storeName, migrating, onClick, onEdit, onDelete, onToggleOnline, onExport,
+  repo, isAdmin, storeName, migrating, onClick, onEdit, onSetMeUp, onDelete, onToggleOnline, onExport,
 }: {
   repo: Repository
   isAdmin: boolean
@@ -320,6 +327,7 @@ function RepoRow({
   migrating?: boolean
   onClick?: () => void
   onEdit: () => void
+  onSetMeUp: () => void
   onDelete: () => void
   onToggleOnline: (online: boolean) => void
   onExport: () => void
@@ -342,15 +350,15 @@ function RepoRow({
     }}>
       <span style={{
         width: 7, height: 7, borderRadius: '50%', flexShrink: 0,
-        background: repo.online ? 'var(--holo-green)' : 'rgba(255,255,255,0.2)',
+        background: repo.online ? 'var(--holo-green)' : 'rgba(var(--holo-ink-rgb), 0.2)',
         boxShadow: repo.online ? '0 0 5px var(--holo-green)' : 'none',
         display: 'inline-block',
       }} />
       <span style={{
         fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 4,
         textTransform: 'uppercase' as const, letterSpacing: '0.3px',
-        background: (FORMAT_COLORS[repo.format] ?? '#6b7280') + '22',
-        color: FORMAT_COLORS[repo.format] ?? '#6b7280',
+        background: tint(FORMAT_COLORS[repo.format] ?? 'var(--holo-c-gray)', 0.133),
+        color: FORMAT_COLORS[repo.format] ?? 'var(--holo-c-gray)',
         whiteSpace: 'nowrap' as const,
       }}>
         {repo.format}
@@ -383,7 +391,7 @@ function RepoRow({
           borderRadius: 10,
           background: 'rgba(59,130,246,0.15)',
           border: '1px solid rgba(59,130,246,0.3)',
-          color: '#60a5fa',
+          color: 'var(--holo-c-blue-400)',
         }}>
           ⟳ migrating
         </span>
@@ -393,7 +401,7 @@ function RepoRow({
           {quota ? formatBytes(quota.usedBytes) : '—'}
         </div>
         {quota?.quotaBytes != null && (
-          <div style={{ height: 3, background: 'rgba(255,255,255,0.08)', borderRadius: 2, overflow: 'hidden', marginTop: 3 }}>
+          <div style={{ height: 3, background: 'rgba(var(--holo-ink-rgb), 0.08)', borderRadius: 2, overflow: 'hidden', marginTop: 3 }}>
             <div style={{
               height: '100%', borderRadius: 2,
               width: `${Math.min(pct ?? 0, 100)}%`,
@@ -402,8 +410,15 @@ function RepoRow({
           </div>
         )}
       </div>
-      {isAdmin && (
-        <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+      <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+        <HoloButton
+          icon={<Terminal size={14} />}
+          onClick={e => { e.stopPropagation(); onSetMeUp() }}
+          onKeyDown={e => e.stopPropagation()}
+          title="Set me up"
+          aria-label={`Set me up: ${repo.name}`}
+        />
+        {isAdmin && (<>
           <HoloButton
             icon={<Power size={14} />}
             onClick={e => { e.stopPropagation(); onToggleOnline(!repo.online) }}
@@ -417,8 +432,8 @@ function RepoRow({
           />
           <HoloButton icon={<Settings2 size={14} />} onClick={e => { e.stopPropagation(); onEdit() }} title="Settings" />
           <HoloButton variant="danger" icon={<Trash2 size={14} />} onClick={e => { e.stopPropagation(); onDelete() }} title="Delete" />
-        </div>
-      )}
+        </>)}
+      </div>
     </div>
   )
 }
@@ -454,6 +469,71 @@ function assignOrDelete(cfg: Record<string, unknown>, key: string, value: string
 
 const LABEL_STYLE = { fontSize: 12, fontWeight: 500, color: 'var(--holo-text-dim)', textTransform: 'uppercase' as const, letterSpacing: '0.4px' }
 const ERROR_STYLE = { background: 'rgba(255,107,107,0.12)', border: '1px solid rgba(255,107,107,0.3)', borderRadius: 10, padding: '10px 12px', color: 'var(--holo-red)', fontSize: 13 }
+
+/** Hosted-repository write policy (formatConfig.write_policy, #539). */
+type WritePolicy = 'allow' | 'allow_once' | 'deny'
+
+const WRITE_POLICY_OPTIONS: { value: WritePolicy; label: string }[] = [
+  { value: 'allow', label: 'Allow redeploy' },
+  { value: 'allow_once', label: 'Disable redeploy' },
+  { value: 'deny', label: 'Read-only' },
+]
+
+const WRITE_POLICY_HINTS: Record<WritePolicy, string> = {
+  allow: 'A deploy to an existing path replaces the stored artifact.',
+  allow_once: 'Each path can be deployed once; a second deploy of the same version is rejected.',
+  deny: 'Every deploy is rejected. Existing artifacts stay readable.',
+}
+
+/** Formats that have a mutable "latest" tag the policy can exempt. */
+const hasLatestTag = (format: string) => format === 'docker' || format === 'oci'
+
+function readWritePolicy(cfg: Record<string, unknown> | null | undefined): WritePolicy {
+  const v = cfg?.['write_policy']
+  return v === 'allow_once' || v === 'deny' ? v : 'allow'
+}
+
+/**
+ * Writes the policy keys into a formatConfig copy. allow_redeploy_latest is
+ * kept only where it means something (docker/oci under Disable redeploy):
+ * the API refuses it anywhere else.
+ */
+function withWritePolicy(cfg: Record<string, unknown>, format: string, policy: WritePolicy, allowLatest: boolean) {
+  const out: Record<string, unknown> = { ...cfg, write_policy: policy }
+  if (hasLatestTag(format) && policy === 'allow_once' && allowLatest) out.allow_redeploy_latest = true
+  else delete out.allow_redeploy_latest
+  return out
+}
+
+function WritePolicyFields({ format, policy, allowLatest, onPolicyChange, onAllowLatestChange }: {
+  format: string
+  policy: WritePolicy
+  allowLatest: boolean
+  onPolicyChange: (p: WritePolicy) => void
+  onAllowLatestChange: (v: boolean) => void
+}) {
+  return (
+    <div className={styles.formRow}>
+      <label style={LABEL_STYLE}>Deployment policy</label>
+      <Select
+        options={WRITE_POLICY_OPTIONS}
+        value={policy}
+        onChange={v => onPolicyChange(v as WritePolicy)}
+      />
+      <span className={styles.hint}>{WRITE_POLICY_HINTS[policy]}</span>
+      {hasLatestTag(format) && policy === 'allow_once' && (
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--holo-text)', cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={allowLatest}
+            onChange={e => onAllowLatestChange(e.target.checked)}
+          />
+          Allow redeploy of &apos;latest&apos;
+        </label>
+      )}
+    </div>
+  )
+}
 
 function CreateRepoModal({ onClose, onCreated }: {
   onClose: () => void
@@ -491,6 +571,8 @@ function CreateRepoModal({ onClose, onCreated }: {
     allowAnonymous: false,
     blobStoreId: '',
     routingRuleId: '' as string,
+    writePolicy: 'allow' as WritePolicy,
+    allowRedeployLatest: false,
   })
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
@@ -562,6 +644,9 @@ function CreateRepoModal({ onClose, onCreated }: {
         body.proxyConfig = proxyConfig
       }
       if (form.type === 'group') body.formatConfig = { member_names: form.memberNames }
+      if (form.type === 'hosted') {
+        body.formatConfig = withWritePolicy({}, form.format, form.writePolicy, form.allowRedeployLatest)
+      }
       if (form.type === 'group' && form.routingRuleId) {
         body.routingRuleId = form.routingRuleId
       }
@@ -628,6 +713,15 @@ function CreateRepoModal({ onClose, onCreated }: {
           placeholder="Optional description"
         />
       </div>
+      {form.type === 'hosted' && (
+        <WritePolicyFields
+          format={form.format}
+          policy={form.writePolicy}
+          allowLatest={form.allowRedeployLatest}
+          onPolicyChange={p => setField('writePolicy', p)}
+          onAllowLatestChange={v => setField('allowRedeployLatest', v)}
+        />
+      )}
       {form.type === 'proxy' && (
         <div className={styles.formRow}>
           <label style={LABEL_STYLE}>Remote URL *</label>
@@ -883,12 +977,14 @@ function EditRepoModal({
   repo,
   onClose,
   onSaved,
+  onSetMeUp,
   onMigrationStarted,
   onMigrationEnded,
 }: {
   repo: Repository
   onClose: () => void
   onSaved: () => void
+  onSetMeUp?: () => void
   onMigrationStarted?: (repoName: string) => void
   onMigrationEnded?: (repoName: string) => void
 }) {
@@ -944,6 +1040,8 @@ function EditRepoModal({
   const [clearRemotePassword, setClearRemotePassword] = useState(false)
   const hasStoredRemotePassword = repo.proxyConfig?.['remote_password_set'] === true
   const [memberNames, setMemberNames] = useState<string[]>(groupMemberNames(repo))
+  const [writePolicy, setWritePolicy] = useState<WritePolicy>(readWritePolicy(repo.formatConfig))
+  const [allowRedeployLatest, setAllowRedeployLatest] = useState(repo.formatConfig?.['allow_redeploy_latest'] === true)
   const memberCandidates = allRepos.filter(r => r.format === repo.format && r.type !== 'group')
   const originalStoreId = repo.blobStoreId ?? ''
   const storeChanged = blobStoreId !== originalStoreId
@@ -1061,6 +1159,11 @@ function EditRepoModal({
         void _drop
         updateBody.formatConfig = { ...rest, member_names: memberNames }
       }
+      if (repo.type === 'hosted') {
+        // formatConfig is replaced wholesale on update: carry every other key.
+        updateBody.formatConfig = withWritePolicy(
+          (repo.formatConfig ?? {}) as Record<string, unknown>, repo.format, writePolicy, allowRedeployLatest)
+      }
       if (repo.type === 'proxy') {
         const proxyConfig: Record<string, unknown> = {}
         for (const [k, v] of Object.entries(repo.proxyConfig ?? {})) {
@@ -1096,7 +1199,14 @@ function EditRepoModal({
 
   return (
     <HoloModal open={true} onClose={onClose} style={{ minWidth: 640 }} titleId="repo-modal-title">
-      <h2 id="repo-modal-title" style={{ fontSize: 17, fontWeight: 700, color: 'var(--holo-text)', margin: 0 }}>Repository settings</h2>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <h2 id="repo-modal-title" style={{ fontSize: 17, fontWeight: 700, color: 'var(--holo-text)', margin: 0 }}>Repository settings</h2>
+        {onSetMeUp && (
+          <HoloButton icon={<Terminal size={14} />} onClick={onSetMeUp} style={{ marginLeft: 'auto' }}>
+            Set me up
+          </HoloButton>
+        )}
+      </div>
       <form onSubmit={handleSubmit} className={styles.form}>
         <div className={styles.formRow}>
           <label style={LABEL_STYLE}>Name</label>
@@ -1133,6 +1243,15 @@ function EditRepoModal({
             placeholder="Optional"
           />
         </div>
+        {repo.type === 'hosted' && (
+          <WritePolicyFields
+            format={repo.format}
+            policy={writePolicy}
+            allowLatest={allowRedeployLatest}
+            onPolicyChange={setWritePolicy}
+            onAllowLatestChange={setAllowRedeployLatest}
+          />
+        )}
         {repo.type === 'proxy' && (
           <div className={styles.formRow}>
             <label style={LABEL_STYLE}>Remote URL *</label>
@@ -1314,7 +1433,7 @@ function EditRepoModal({
               onChange={setBlobStoreId}
             />
             {storeChanged ? (
-              <span className={styles.hint} style={{ color: '#f59e0b' }}>
+              <span className={styles.hint} style={{ color: 'var(--holo-c-amber)' }}>
                 ⚠ Existing artifacts stay on the original store. Only future uploads land on the new one.
               </span>
             ) : (
@@ -1338,7 +1457,7 @@ function EditRepoModal({
                   {migrLoading ? 'Starting…' : 'Migrate Content'}
                 </button>
                 {migrError && (
-                  <p role="alert" style={{ color: '#ef4444', fontSize: 12, marginTop: 4 }}>{migrError}</p>
+                  <p role="alert" style={{ color: 'var(--holo-c-red)', fontSize: 12, marginTop: 4 }}>{migrError}</p>
                 )}
               </div>
             )}
@@ -1352,7 +1471,7 @@ function EditRepoModal({
                 borderRadius: 8,
               }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                  <span style={{ fontSize: 12, color: '#94a3b8' }}>
+                  <span style={{ fontSize: 12, color: 'var(--holo-c-slate-400)' }}>
                     {migration.status === 'running' || migration.status === 'pending'
                       ? 'Migrating content…'
                       : migration.status === 'cancelled' ? 'Migration cancelled'
@@ -1371,15 +1490,15 @@ function EditRepoModal({
                 </div>
                 {migration.totalAssets > 0 && (
                   <>
-                    <div style={{ height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.1)', overflow: 'hidden', marginBottom: 4 }}>
+                    <div style={{ height: 4, borderRadius: 2, background: 'rgba(var(--holo-ink-rgb), 0.1)', overflow: 'hidden', marginBottom: 4 }}>
                       <div style={{
                         height: '100%',
                         width: `${Math.round((migration.doneAssets / migration.totalAssets) * 100)}%`,
-                        background: migration.status === 'failed' ? '#ef4444' : '#3b82f6',
+                        background: migration.status === 'failed' ? 'var(--holo-c-red)' : 'var(--holo-c-blue)',
                         transition: 'width 0.3s ease',
                       }} />
                     </div>
-                    <div style={{ fontSize: 11, color: '#64748b' }}>
+                    <div style={{ fontSize: 11, color: 'var(--holo-c-slate-500)' }}>
                       {migration.doneAssets} / {migration.totalAssets} assets · {formatBytes(migration.doneBytes)} / {formatBytes(migration.totalBytes)}
                     </div>
                   </>
@@ -1387,7 +1506,7 @@ function EditRepoModal({
               </div>
             )}
             {migration?.status === 'done' && (
-              <div style={{ marginTop: 8, fontSize: 12, color: '#22c55e' }}>
+              <div style={{ marginTop: 8, fontSize: 12, color: 'var(--holo-c-green)' }}>
                 ✓ Migration complete — content is now on the new store
               </div>
             )}

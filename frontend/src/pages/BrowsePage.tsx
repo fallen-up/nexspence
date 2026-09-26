@@ -4,7 +4,6 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { HoloButton, HoloInput, HoloModal } from '@/components/holo'
 import { Truncated } from '@/components/Truncated'
 import {
-  BookOpen,
   ChevronDown,
   ChevronRight,
   Download,
@@ -16,14 +15,18 @@ import {
   RefreshCw,
   ShieldAlert,
   Tag,
+  Terminal,
   Trash2,
   Upload,
+  X,
 } from 'lucide-react'
 import axios from 'axios'
 import { nexusApi, nexspenceApi, apiClient, Privilege } from '@/api/client'
 import { Select, SelectOption } from '../components/Select'
 import { useAuthStore } from '@/store/authStore'
 import { TagEditor } from '@/components/TagEditor'
+import { tint } from '@/theme/color'
+import { SetMeUpDialog } from '@/components/SetMeUpDialog'
 
 interface Repository {
   id: string
@@ -31,13 +34,31 @@ interface Repository {
   format: string
   type: string
 }
+interface ComponentAsset {
+  id: string
+  path: string
+  fileSize: number
+  contentType: string
+  /** Member repository that stores the asset — differs from the browsed one in a group. */
+  repository?: string
+  createdAt?: string
+  lastModified?: string
+  lastDownloaded?: string | null
+  sha256?: string
+  sha1?: string
+  md5?: string
+}
+
 interface Component {
   id: string
   name: string
   group: string
   version: string
   format: string
-  assets?: { id: string; path: string; fileSize: number; contentType: string; lastModified?: string }[]
+  repository?: string
+  createdAt?: string
+  lastDownloaded?: string | null
+  assets?: ComponentAsset[]
 }
 
 interface DockerDetailAsset {
@@ -103,11 +124,6 @@ interface RawTreeNode {
   children?: RawTreeNode[]
 }
 
-interface UsageTarget {
-  format: string
-  name: string
-}
-
 interface RawFileSelection {
   path: string
   node: RawTreeNode
@@ -153,12 +169,12 @@ interface PromotionRule {
 const SEV_COLOR = {
   // Off the red→green CVSS ramp on purpose: a compromised package is a
   // different class of alert, not a worse CVE.
-  malicious: '#d946ef',
-  critical: '#ef4444',
-  high: '#f97316',
-  medium: '#f59e0b',
-  low: '#22c55e',
-  unknown: '#6b7280',
+  malicious: 'var(--holo-c-fuchsia)',
+  critical: 'var(--holo-c-red)',
+  high: 'var(--holo-c-orange)',
+  medium: 'var(--holo-c-amber)',
+  low: 'var(--holo-c-green)',
+  unknown: 'var(--holo-c-gray)',
 } as const
 
 function sevChipColor(sev: string) {
@@ -180,9 +196,9 @@ function CveBadge({ label, count, color }: { label: string; count: number; color
         fontWeight: 700,
         padding: '2px 7px',
         borderRadius: 4,
-        background: color + '22',
+        background: tint(color, 0.133),
         color,
-        border: '1px solid ' + color + '55',
+        border: '1px solid ' + tint(color, 0.333),
         marginRight: 4,
       }}
     >
@@ -266,7 +282,7 @@ function ScanBadgeRow({ componentId }: { componentId: string }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '10px 0 0' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <ShieldAlert size={14} style={{ color: '#60a5fa', flexShrink: 0 }} />
+        <ShieldAlert size={14} style={{ color: 'var(--holo-c-blue-400)', flexShrink: 0 }} />
         <span style={{ fontSize: 12, color: 'var(--holo-text-dim)' }}>Vulnerability scan</span>
         {!isScanningThis && scanResult && (
           <span style={{ fontSize: 11, color: 'var(--holo-text-faint)' }}>
@@ -286,7 +302,7 @@ function ScanBadgeRow({ componentId }: { componentId: string }) {
         </HoloButton>
       </div>
       {mutationError && (
-        <span style={{ fontSize: 11, color: '#ef4444' }}>Error: {mutationError}</span>
+        <span style={{ fontSize: 11, color: 'var(--holo-c-red)' }}>Error: {mutationError}</span>
       )}
       {isScanningThis && (
         <span style={{ fontSize: 11, color: 'var(--holo-text-faint)', lineHeight: 1.4 }}>
@@ -298,7 +314,7 @@ function ScanBadgeRow({ componentId }: { componentId: string }) {
       {!isScanningThis && isLoading ? (
         <span style={{ fontSize: 11, color: 'var(--holo-text-faint)' }}>Loading…</span>
       ) : !isScanningThis && scanResult?.status === 'failed' ? (
-        <span style={{ fontSize: 11, color: '#ef4444' }}>Scan failed: {scanResult.error}</span>
+        <span style={{ fontSize: 11, color: 'var(--holo-c-red)' }}>Scan failed: {scanResult.error}</span>
       ) : !isScanningThis && s ? (
         <>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 2 }}>
@@ -311,7 +327,7 @@ function ScanBadgeRow({ componentId }: { componentId: string }) {
               <CveBadge label="UNKNOWN" count={s.unknown} color={SEV_COLOR.unknown} />
             )}
             {s.total === 0 && (
-              <span style={{ fontSize: 11, color: '#22c55e', fontWeight: 600 }}>No vulnerabilities found</span>
+              <span style={{ fontSize: 11, color: 'var(--holo-c-green)', fontWeight: 600 }}>No vulnerabilities found</span>
             )}
           </div>
           {scanResult?.status === 'ok' && findings.length > 0 && (
@@ -332,9 +348,9 @@ function ScanBadgeRow({ componentId }: { componentId: string }) {
                       background:
                         sevFilter === f
                           ? f === 'ALL'
-                            ? '#3b82f6'
+                            ? 'var(--holo-c-blue)'
                             : sevChipColor(f)
-                          : 'rgba(255,255,255,0.06)',
+                          : 'rgba(var(--holo-ink-rgb), 0.06)',
                       color: sevFilter === f ? '#fff' : 'var(--holo-text-dim)',
                     }}
                   >
@@ -347,7 +363,7 @@ function ScanBadgeRow({ componentId }: { componentId: string }) {
                 style={{
                   maxHeight: 280,
                   overflowY: 'auto' as const,
-                  border: '1px solid rgba(255,255,255,0.08)',
+                  border: '1px solid rgba(var(--holo-ink-rgb), 0.08)',
                   borderRadius: 8,
                   fontSize: 11,
                 }}
@@ -355,18 +371,18 @@ function ScanBadgeRow({ componentId }: { componentId: string }) {
                 <table style={{ width: '100%', borderCollapse: 'collapse' as const }}>
                   <thead>
                     <tr style={{ color: 'var(--holo-text-faint)', textAlign: 'left' as const }}>
-                      <th style={{ padding: '8px 10px', fontWeight: 600, position: 'sticky', top: 0, background: '#0c1018' }}>CVE</th>
-                      <th style={{ padding: '8px 6px', fontWeight: 600, position: 'sticky', top: 0, background: '#0c1018' }}>Sev</th>
-                      <th style={{ padding: '8px 6px', fontWeight: 600, position: 'sticky', top: 0, background: '#0c1018' }}>Package</th>
-                      <th style={{ padding: '8px 6px', fontWeight: 600, position: 'sticky', top: 0, background: '#0c1018' }}>Installed</th>
-                      <th style={{ padding: '8px 6px', fontWeight: 600, position: 'sticky', top: 0, background: '#0c1018' }}>Fixed</th>
-                      <th style={{ padding: '8px 6px', fontWeight: 600, position: 'sticky', top: 0, background: '#0c1018' }}>Title</th>
+                      <th style={{ padding: '8px 10px', fontWeight: 600, position: 'sticky', top: 0, background: 'var(--holo-surface-sticky)' }}>CVE</th>
+                      <th style={{ padding: '8px 6px', fontWeight: 600, position: 'sticky', top: 0, background: 'var(--holo-surface-sticky)' }}>Sev</th>
+                      <th style={{ padding: '8px 6px', fontWeight: 600, position: 'sticky', top: 0, background: 'var(--holo-surface-sticky)' }}>Package</th>
+                      <th style={{ padding: '8px 6px', fontWeight: 600, position: 'sticky', top: 0, background: 'var(--holo-surface-sticky)' }}>Installed</th>
+                      <th style={{ padding: '8px 6px', fontWeight: 600, position: 'sticky', top: 0, background: 'var(--holo-surface-sticky)' }}>Fixed</th>
+                      <th style={{ padding: '8px 6px', fontWeight: 600, position: 'sticky', top: 0, background: 'var(--holo-surface-sticky)' }}>Title</th>
                     </tr>
                   </thead>
                   <tbody>
                     {filtered.map((row, i) => (
-                      <tr key={`${row.id}-${row.pkgName}-${i}`} style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}>
-                        <td style={{ padding: '6px 10px', fontFamily: 'monospace', color: '#a5b4fc' }}>{row.id}</td>
+                      <tr key={`${row.id}-${row.pkgName}-${i}`} style={{ borderTop: '1px solid rgba(var(--holo-ink-rgb), 0.05)' }}>
+                        <td style={{ padding: '6px 10px', fontFamily: 'monospace', color: 'var(--holo-c-indigo-300)' }}>{row.id}</td>
                         <td style={{ padding: '6px 6px' }}>
                           <span
                             style={{
@@ -374,7 +390,7 @@ function ScanBadgeRow({ componentId }: { componentId: string }) {
                               fontWeight: 700,
                               padding: '1px 5px',
                               borderRadius: 3,
-                              background: sevChipColor(row.severity) + '33',
+                              background: tint(sevChipColor(row.severity), 0.2),
                               color: sevChipColor(row.severity),
                             }}
                           >
@@ -385,7 +401,7 @@ function ScanBadgeRow({ componentId }: { componentId: string }) {
                         <td style={{ padding: '6px 6px', fontFamily: 'monospace', color: 'var(--holo-text-dim)' }}>
                           {row.installedVersion}
                         </td>
-                        <td style={{ padding: '6px 6px', fontFamily: 'monospace', color: '#86efac' }}>{row.fixedVersion || '—'}</td>
+                        <td style={{ padding: '6px 6px', fontFamily: 'monospace', color: 'var(--holo-c-green-300)' }}>{row.fixedVersion || '—'}</td>
                         <Truncated
                           as="td"
                           text={row.title || '—'}
@@ -434,6 +450,31 @@ function formatPushDate(iso: string | undefined | null): string {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return '—'
   return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+}
+
+// The URL an asset is served from — the same shape the server computes for
+// downloadUrl, minus the configured base URL so the fetch stays same-origin and
+// carries the session. Only `?` and `#` are escaped: they would end the path,
+// while everything else is stored exactly as the format's handler expects it.
+function assetDownloadPath(repo: string, path: string): string {
+  const clean = path.replace(/^\/+/, '').replace(/[?#]/g, (ch) => encodeURIComponent(ch))
+  return `/repository/${repo}/${clean}`
+}
+
+// Authenticated download: a plain <a href> would go out without the bearer
+// token, so the blob is fetched through the API client and handed to the
+// browser from memory.
+function downloadAsBlob(url: string, filename: string): Promise<void> {
+  return apiClient.get(url, { responseType: 'blob' }).then((res) => {
+    const href = window.URL.createObjectURL(res.data as Blob)
+    const a = document.createElement('a')
+    a.href = href
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    window.URL.revokeObjectURL(href)
+  })
 }
 
 function nexusV2RegistryPath(
@@ -517,8 +558,8 @@ const S = {
     // take ~410px).
     minWidth: 640,
     padding: '10px 16px',
-    background: 'rgba(255,255,255,0.03)',
-    borderBottom: '1px solid rgba(255,255,255,0.07)',
+    background: 'rgba(var(--holo-ink-rgb), 0.03)',
+    borderBottom: '1px solid rgba(var(--holo-ink-rgb), 0.07)',
     fontSize: 11,
     fontWeight: 600,
     color: 'var(--holo-text-dim)',
@@ -531,7 +572,7 @@ const S = {
     columnGap: 12,
     minWidth: 640,
     padding: '11px 16px',
-    borderBottom: '1px solid rgba(255,255,255,0.05)',
+    borderBottom: '1px solid rgba(var(--holo-ink-rgb), 0.05)',
     fontSize: 13,
     color: 'var(--holo-text)',
     alignItems: 'center',
@@ -541,15 +582,15 @@ const S = {
     fontWeight: 600 as const,
     padding: '2px 8px',
     borderRadius: 4,
-    background: color + '22',
+    background: tint(color, 0.133),
     color,
   }),
   muted: { color: 'var(--holo-text-faint)', fontSize: 12 },
-  path: { fontSize: 12, color: 'rgba(147,197,253,0.85)', fontFamily: 'monospace' as const },
+  path: { fontSize: 12, color: 'var(--holo-tx-blue-300-85)', fontFamily: 'monospace' as const },
   pager: { display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'center', paddingTop: 4, flexShrink: 0 },
   pgBtn: (disabled: boolean) => ({
-    background: disabled ? 'rgba(255,255,255,0.03)' : 'rgba(255,255,255,0.07)',
-    border: '1px solid rgba(255,255,255,0.1)',
+    background: disabled ? 'rgba(var(--holo-ink-rgb), 0.03)' : 'rgba(var(--holo-ink-rgb), 0.07)',
+    border: '1px solid rgba(var(--holo-ink-rgb), 0.1)',
     borderRadius: 8,
     padding: '6px 14px',
     color: disabled ? 'var(--holo-text-faint)' : 'var(--holo-text)',
@@ -596,7 +637,7 @@ const S = {
     gridTemplateColumns: '168px 1fr',
     gap: '8px 14px',
     padding: '7px 0',
-    borderBottom: '1px solid rgba(255,255,255,0.06)',
+    borderBottom: '1px solid rgba(var(--holo-ink-rgb), 0.06)',
     fontSize: 13,
   },
   detailLabel: { color: 'var(--holo-text-faint)', fontSize: 12 },
@@ -623,7 +664,7 @@ function GhostBtn({ onClick, title, danger = false, children }: {
     background: danger
       ? (act ? 'rgba(255,107,107,0.3)' : hov ? 'rgba(255,107,107,0.18)' : 'rgba(255,107,107,0.07)')
       : (act ? 'rgba(124,92,255,0.35)' : hov ? 'rgba(124,92,255,0.2)' : 'rgba(124,92,255,0.08)'),
-    color: danger ? '#ff6b6b' : 'rgba(124,92,255,0.9)',
+    color: danger ? 'var(--holo-red)' : 'var(--holo-tx-purple-90)',
   }
   return (
     <button type="button" title={title} style={style} onClick={onClick}
@@ -651,15 +692,15 @@ function PanelBtn({ onClick, variant = 'default', children }: {
         transform: act ? 'scale(0.95)' : 'scale(1)',
         background: act ? 'rgba(59,130,246,0.35)' : hov ? 'rgba(59,130,246,0.25)' : 'rgba(59,130,246,0.15)',
         border: `1px solid ${act ? 'rgba(59,130,246,0.7)' : hov ? 'rgba(59,130,246,0.6)' : 'rgba(59,130,246,0.4)'}`,
-        color: hov ? '#bfdbfe' : '#93c5fd',
+        color: hov ? 'var(--holo-c-blue-200)' : 'var(--holo-c-blue-300)',
       }
     : {
         padding: '7px 14px', borderRadius: 8, fontSize: 12, cursor: 'pointer',
         display: 'flex', alignItems: 'center', gap: 5,
         transition: 'background 0.12s, border-color 0.12s, transform 0.08s',
         transform: act ? 'scale(0.95)' : 'scale(1)',
-        background: act ? 'rgba(124,92,255,0.18)' : hov ? 'rgba(124,92,255,0.1)' : 'rgba(255,255,255,0.05)',
-        border: `1px solid ${act ? 'rgba(124,92,255,0.5)' : hov ? 'rgba(124,92,255,0.35)' : 'rgba(255,255,255,0.1)'}`,
+        background: act ? 'rgba(124,92,255,0.18)' : hov ? 'rgba(124,92,255,0.1)' : 'rgba(var(--holo-ink-rgb), 0.05)',
+        border: `1px solid ${act ? 'rgba(124,92,255,0.5)' : hov ? 'rgba(124,92,255,0.35)' : 'rgba(var(--holo-ink-rgb), 0.1)'}`,
         color: hov ? 'var(--holo-text)' : 'var(--holo-text-dim)',
       }
   return (
@@ -690,32 +731,145 @@ function RawTagSection({ componentId, isAdmin: admin }: { componentId: string; i
   )
 }
 
+function DetailRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div style={S.detailRow}>
+      <div style={S.detailLabel}>{label}</div>
+      <div style={mono ? { ...S.detailValue, ...S.path, fontSize: 11 } : S.detailValue}>{value}</div>
+    </div>
+  )
+}
+
+function ComponentAssetDetail({ asset, repo }: { asset: ComponentAsset; repo: string }) {
+  const [downloadError, setDownloadError] = useState<string | null>(null)
+  const downloadUrl = assetDownloadPath(repo, asset.path)
+  const filename = asset.path.split('/').filter(Boolean).pop() || 'download'
+  const checksums: { label: string; value: string | undefined }[] = [
+    { label: 'SHA256', value: asset.sha256 },
+    { label: 'SHA1', value: asset.sha1 },
+    { label: 'MD5', value: asset.md5 },
+  ]
+  return (
+    <div
+      data-testid="component-asset"
+      style={{ borderTop: '1px solid var(--holo-border)', paddingTop: 10, marginTop: 10 }}
+    >
+      <div style={{ ...S.path, wordBreak: 'break-all' as const, marginBottom: 4 }}>{asset.path}</div>
+      <DetailRow label="Content type" value={asset.contentType || '—'} />
+      <DetailRow label="Size" value={formatBytes(asset.fileSize ?? 0)} />
+      <DetailRow label="Created" value={formatDateTime(asset.createdAt)} />
+      <DetailRow label="Updated" value={formatDateTime(asset.lastModified)} />
+      <DetailRow label="Last downloaded" value={formatDateTime(asset.lastDownloaded)} />
+      {checksums.filter((c) => c.value).map((c) => (
+        <DetailRow key={c.label} label={c.label} value={c.value!} mono />
+      ))}
+      <div style={{ ...S.detailActions, marginTop: 10, flexWrap: 'wrap' as const }}>
+        <PanelBtn
+          variant="primary"
+          onClick={() => {
+            setDownloadError(null)
+            downloadAsBlob(downloadUrl, filename).catch((e: unknown) => {
+              const status = (e as { response?: { status?: number } })?.response?.status
+              setDownloadError(status ? `Download failed (HTTP ${status})` : 'Download failed')
+            })
+          }}
+        >
+          <Download size={13} /> Download
+        </PanelBtn>
+        <PanelBtn onClick={() => { void navigator.clipboard.writeText(`${window.location.origin}${downloadUrl}`) }}>
+          <Link size={13} /> Copy link
+        </PanelBtn>
+      </div>
+      {downloadError && (
+        <div role="alert" style={{ fontSize: 12, color: 'var(--holo-red)', marginTop: 6 }}>
+          {downloadError}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Detail panel for the table formats (#535): everything the listing already
+// carries for a component, laid out like the Docker and Raw panels, with a
+// download per asset. It reads the row's own data — no extra request — so it
+// can never show a component from another repository or page.
+function ComponentDetailPanel({
+  comp,
+  repoName,
+  onClose,
+}: {
+  comp: Component
+  repoName: string
+  onClose: () => void
+}) {
+  // In a group the component lives in a member repository; its assets are
+  // served from there, which is also where the listing's RBAC check passed.
+  const compRepo = comp.repository || repoName
+  const assets = comp.assets ?? []
+  return (
+    <div
+      className="holo-card"
+      style={S.detailPanel}
+      role="region"
+      aria-label="Component details"
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') {
+          e.stopPropagation()
+          onClose()
+        }
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+        <h2 style={S.detailTitle}>Component details</h2>
+        <GhostBtn onClick={onClose} title="Close details">
+          <X size={12} />
+        </GhostBtn>
+      </div>
+      <DetailRow label="Name" value={comp.name} />
+      <DetailRow label="Group" value={comp.group || '—'} />
+      <DetailRow label="Version" value={comp.version || '—'} />
+      <DetailRow label="Format" value={comp.format} />
+      <DetailRow label="Repository" value={compRepo} />
+      <DetailRow label="Created" value={formatDateTime(comp.createdAt)} />
+      <DetailRow label="Last downloaded" value={formatDateTime(comp.lastDownloaded)} />
+      <h3 style={{ ...S.detailTitle, fontSize: 13, margin: '16px 0 0' }}>Assets ({assets.length})</h3>
+      {assets.length === 0 ? (
+        <p style={S.muted}>This component has no assets.</p>
+      ) : (
+        assets.map((a) => (
+          <ComponentAssetDetail key={a.id || a.path} asset={a} repo={a.repository || compRepo} />
+        ))
+      )}
+    </div>
+  )
+}
+
 const FORMAT_COLORS: Record<string, string> = {
-  maven2: '#f97316',
-  npm: '#ef4444',
-  docker: '#3b82f6',
-  pypi: '#a78bfa',
-  go: '#06b6d4',
-  nuget: '#8b5cf6',
-  helm: '#0ea5e9',
-  raw: '#6b7280',
-  apt: '#f59e0b',
-  yum: '#10b981',
+  maven2: 'var(--holo-c-orange)',
+  npm: 'var(--holo-c-red)',
+  docker: 'var(--holo-c-blue)',
+  pypi: 'var(--holo-c-violet-400)',
+  go: 'var(--holo-c-cyan)',
+  nuget: 'var(--holo-c-violet-500)',
+  helm: 'var(--holo-c-sky)',
+  raw: 'var(--holo-c-gray)',
+  apt: 'var(--holo-c-amber)',
+  yum: 'var(--holo-c-emerald)',
   cran: '#276dc3',
   alpine: '#0d597f',
-  huggingface: '#ffd21e',
+  huggingface: 'var(--holo-c-yellow)',
 }
 
 // Colors for the artifact-type labels the registry browse tree reports. A media
 // type the server did not recognize arrives verbatim and has no entry here, so
 // it falls back to a neutral tone rather than borrowing another kind's color.
 const ARTIFACT_TYPE_COLORS: Record<string, string> = {
-  chart: '#0ea5e9',
-  image: '#3b82f6',
-  wasm: '#8b5cf6',
-  sbom: '#10b981',
-  signature: '#f59e0b',
-  attestation: '#f97316',
+  chart: 'var(--holo-c-sky)',
+  image: 'var(--holo-c-blue)',
+  wasm: 'var(--holo-c-violet-500)',
+  sbom: 'var(--holo-c-emerald)',
+  signature: 'var(--holo-c-amber)',
+  attestation: 'var(--holo-c-orange)',
 }
 
 // What is attached to the selected manifest: signatures, SBOMs, attestations.
@@ -742,7 +896,7 @@ function ReferrersSection({
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '10px 0 0' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <Link size={14} style={{ color: '#60a5fa', flexShrink: 0 }} />
+        <Link size={14} style={{ color: 'var(--holo-c-blue-400)', flexShrink: 0 }} />
         <span style={{ fontSize: 12, color: 'var(--holo-text-dim)' }}>Referrers</span>
         {data?.source === 'cache' && (
           // A proxy knows only what was pulled through it, so an empty list here
@@ -754,7 +908,7 @@ function ReferrersSection({
       </div>
       {isLoading && <div style={S.muted}>Loading…</div>}
       {!isLoading && error != null && (
-        <div style={{ fontSize: 12, color: '#f87171' }} data-testid="referrers-error">
+        <div style={{ fontSize: 12, color: 'var(--holo-c-red-400)' }} data-testid="referrers-error">
           Could not list referrers
         </div>
       )}
@@ -768,7 +922,7 @@ function ReferrersSection({
           style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}
         >
           {ref.artifactType && (
-            <span style={S.badge(ARTIFACT_TYPE_COLORS[ref.artifactType] ?? '#94a3b8')}>
+            <span style={S.badge(ARTIFACT_TYPE_COLORS[ref.artifactType] ?? 'var(--holo-c-slate-400)')}>
               {ref.artifactType}
             </span>
           )}
@@ -834,11 +988,11 @@ function DockerBrowseDetailBody({
           <div style={S.detailValue}>{r.value}</div>
         </div>
       ))}
-      <div style={{ borderTop: '1px solid rgba(255,255,255,0.08)', marginTop: 8 }}>
+      <div style={{ borderTop: '1px solid rgba(var(--holo-ink-rgb), 0.08)', marginTop: 8 }}>
         <ScanBadgeRow componentId={sel.componentId} />
       </div>
       {(sel.kind === 'tag' || sel.kind === 'manifest') && sel.imageRef && sel.version && (
-        <div style={{ borderTop: '1px solid rgba(255,255,255,0.08)', marginTop: 8 }}>
+        <div style={{ borderTop: '1px solid rgba(var(--holo-ink-rgb), 0.08)', marginTop: 8 }}>
           <ReferrersSection
             repository={comp.repository}
             imageRef={sel.imageRef}
@@ -876,11 +1030,11 @@ function DockerTreeRows({
   if (!isFolder) {
     const icon =
       node.kind === 'manifest' ? (
-        <FileText size={14} style={{ color: '#93c5fd', flexShrink: 0 }} />
+        <FileText size={14} style={{ color: 'var(--holo-c-blue-300)', flexShrink: 0 }} />
       ) : node.kind === 'blob' ? (
-        <Layers size={14} style={{ color: '#a78bfa', flexShrink: 0 }} />
+        <Layers size={14} style={{ color: 'var(--holo-c-violet-400)', flexShrink: 0 }} />
       ) : (
-        <Tag size={14} style={{ color: '#4ade80', flexShrink: 0 }} />
+        <Tag size={14} style={{ color: 'var(--holo-c-green-400)', flexShrink: 0 }} />
       )
     const clickable = !!(node.componentId && onSelectLeaf)
     const selected = selectedPath === node.path
@@ -915,7 +1069,7 @@ function DockerTreeRows({
         {node.artifactType && (
           <span
             data-testid="artifact-type"
-            style={S.badge(ARTIFACT_TYPE_COLORS[node.artifactType] ?? '#94a3b8')}
+            style={S.badge(ARTIFACT_TYPE_COLORS[node.artifactType] ?? 'var(--holo-c-slate-400)')}
           >
             {node.artifactType}
           </span>
@@ -953,7 +1107,7 @@ function DockerTreeRows({
         ) : (
           <span style={{ width: 14 }} />
         )}
-        <FolderOpen size={14} style={{ color: '#60a5fa', flexShrink: 0 }} />
+        <FolderOpen size={14} style={{ color: 'var(--holo-c-blue-400)', flexShrink: 0 }} />
         <span style={{ fontWeight: depth === 0 ? 600 : 500 }}>{node.label}</span>
         {showDelete && onDelete && !['Tags', 'Manifests', 'Blobs'].includes(node.label) && (
           <GhostBtn danger onClick={e => { e.stopPropagation(); onDelete(node) }} title={`Delete all in ${node.label}`}>
@@ -1003,7 +1157,7 @@ function RawTreeRows({
   onSelectFile?: (node: RawTreeNode) => void
   showDelete?: boolean
   onDelete?: (node: RawTreeNode) => void
-  onUsage?: (node: RawTreeNode) => void
+  onUsage?: () => void
   repoName: string
 }) {
   const [hovered, setHovered] = useState(false)
@@ -1015,16 +1169,7 @@ function RawTreeRows({
     const copyUrl = `${window.location.origin}/repository/${repoName}/${cleanPath}`
 
     function doDownload() {
-      void apiClient.get(downloadUrl, { responseType: 'blob' }).then((res) => {
-        const url = window.URL.createObjectURL(res.data as Blob)
-        const a = document.createElement('a')
-        a.href = url
-        a.download = node.label
-        document.body.appendChild(a)
-        a.click()
-        document.body.removeChild(a)
-        window.URL.revokeObjectURL(url)
-      })
+      void downloadAsBlob(downloadUrl, node.label)
     }
 
     function doCopy() {
@@ -1050,11 +1195,11 @@ function RawTreeRows({
         style={{
           ...S.treeRow(depth),
           cursor: 'pointer',
-          background: selected ? 'rgba(59,130,246,0.12)' : hovered ? 'rgba(255,255,255,0.04)' : undefined,
+          background: selected ? 'rgba(59,130,246,0.12)' : hovered ? 'rgba(var(--holo-ink-rgb), 0.04)' : undefined,
           outline: selected ? '1px solid rgba(59,130,246,0.3)' : undefined,
         }}
       >
-        <FileText size={13} style={{ color: '#4ade80', flexShrink: 0 }} />
+        <FileText size={13} style={{ color: 'var(--holo-c-green-400)', flexShrink: 0 }} />
         <Truncated as="span" text={node.label} style={{ fontFamily: 'monospace', fontSize: 12, flex: 1 }} />
         {node.size != null && (
           <span style={{ fontSize: 11, color: 'var(--holo-text-faint)', flexShrink: 0 }}>
@@ -1070,8 +1215,8 @@ function RawTreeRows({
               <Link size={12} />
             </GhostBtn>
             {onUsage && (
-              <GhostBtn onClick={(e) => { e.stopPropagation(); onUsage(node) }} title="Example Usage">
-                <BookOpen size={12} />
+              <GhostBtn onClick={(e) => { e.stopPropagation(); onUsage() }} title="Set me up">
+                <Terminal size={12} />
               </GhostBtn>
             )}
             {showDelete && onDelete && (
@@ -1095,7 +1240,7 @@ function RawTreeRows({
         style={{
           ...S.treeRow(depth),
           ...(hasKids ? S.treeFolder : {}),
-          background: hovered ? 'rgba(255,255,255,0.04)' : undefined,
+          background: hovered ? 'rgba(var(--holo-ink-rgb), 0.04)' : undefined,
         }}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
@@ -1118,7 +1263,7 @@ function RawTreeRows({
         ) : (
           <span style={{ width: 14, flexShrink: 0 }} />
         )}
-        <FolderOpen size={14} style={{ color: '#60a5fa', flexShrink: 0 }} />
+        <FolderOpen size={14} style={{ color: 'var(--holo-c-blue-400)', flexShrink: 0 }} />
         <span style={{ fontWeight: depth === 0 ? 600 : 500, flex: 1 }}>{node.label}</span>
         {hovered && showDelete && onDelete && (
           <GhostBtn danger onClick={e => { e.stopPropagation(); onDelete(node) }} title={`Delete folder ${node.label}`}>
@@ -1175,8 +1320,12 @@ export default function BrowsePage() {
   const [treeCollapsed, setTreeCollapsed] = useState<Record<string, boolean>>({})
   const [dockerSelection, setDockerSelection] = useState<DockerLeafSelection | null>(null)
   const [rawSelection, setRawSelection] = useState<RawFileSelection | null>(null)
+  // Only the id is kept: the panel resolves it against the page on screen, so a
+  // refetch that drops the component (deleted, filtered) closes the panel
+  // instead of leaving a detached copy behind.
+  const [detailComponentId, setDetailComponentId] = useState<string | null>(null)
   const [uploadOpen, setUploadOpen] = useState(false)
-  const [usageTarget, setUsageTarget] = useState<UsageTarget | null>(null)
+  const [setupOpen, setSetupOpen] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<{
     path: string; repo: string;
     dockerImage?: string; dockerRef?: string;
@@ -1268,8 +1417,8 @@ export default function BrowsePage() {
     badge: (
       <span style={{
         fontSize: 10, fontWeight: 600, padding: '1px 6px', borderRadius: 3,
-        background: (FORMAT_COLORS[r.format] ?? '#6b7280') + '22',
-        color: FORMAT_COLORS[r.format] ?? '#6b7280',
+        background: tint(FORMAT_COLORS[r.format] ?? 'var(--holo-c-gray)', 0.133),
+        color: FORMAT_COLORS[r.format] ?? 'var(--holo-c-gray)',
         flexShrink: 0,
       }}>
         {r.format}
@@ -1348,6 +1497,14 @@ export default function BrowsePage() {
 
   const items = useMemo(() => components?.items ?? [], [components])
   const hasNext = !!components?.continuationToken
+  const detailComponent = useMemo(
+    () => (detailComponentId ? items.find((c) => c.id === detailComponentId) ?? null : null),
+    [items, detailComponentId],
+  )
+  const goToPage = (next: number) => {
+    setPage(next)
+    setDetailComponentId(null)
+  }
 
   // When arriving from Search with ?asset=/?cid=, scroll the matching row into view.
   useEffect(() => {
@@ -1412,7 +1569,7 @@ export default function BrowsePage() {
     <div style={S.page}>
       <div style={{ marginBottom: 4, flexShrink: 0 }}>
         <div className="holo-section-label" style={{ marginBottom: 4 }}>WORKSPACE / BROWSE</div>
-        <h1 style={{ fontSize: 20, fontWeight: 700, margin: '0 0 3px', letterSpacing: '-0.01em', lineHeight: 1.2, background: 'linear-gradient(110deg, #7c5cff, #22d3ee 60%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' as const }}>Browse</h1>
+        <h1 style={{ fontSize: 20, fontWeight: 700, margin: '0 0 3px', letterSpacing: '-0.01em', lineHeight: 1.2, background: 'linear-gradient(110deg, var(--holo-a), var(--holo-b) 60%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' as const }}>Browse</h1>
         <p style={{ fontSize: 12, color: 'var(--holo-text-faint)', margin: 0 }}>Explore repository contents</p>
       </div>
       <div style={S.header}>
@@ -1438,15 +1595,22 @@ export default function BrowsePage() {
             setTreeCollapsed({})
             setDockerSelection(null)
             setRawSelection(null)
+            setDetailComponentId(null)
             // Selection must not survive a repo switch: stale IDs from the
             // previous repo would ride into "Promote selected", and the
             // server now refuses such a mixed-repo batch (#255).
             setSelectedComponentIDs(new Set())
             setUploadOpen(false)
+            setSetupOpen(false)
           }}
           placeholder="— Select repository —"
           style={{ minWidth: 240 }}
         />
+        {selectedRepo && (
+          <HoloButton icon={<Terminal size={14} />} onClick={() => setSetupOpen(true)}>
+            Set me up
+          </HoloButton>
+        )}
         {isRaw && selectedRepo?.type === 'hosted' && (isAdmin() || myPrivs.some(p =>
           (p.attrs?.actions as string[] | undefined)?.includes('write')
         )) && (
@@ -1518,8 +1682,8 @@ export default function BrowsePage() {
                 <>
                   <DockerBrowseDetailBody comp={dockerDetail} sel={dockerSelection} />
                   <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                    <PanelBtn onClick={() => setUsageTarget({ format: dockerDetail.format, name: dockerDetail.name })}>
-                      <BookOpen size={13} /> Example Usage
+                    <PanelBtn onClick={() => setSetupOpen(true)}>
+                      <Terminal size={13} /> Set me up
                     </PanelBtn>
                     {signedIn && <PanelBtn onClick={async () => {
                       try {
@@ -1586,7 +1750,7 @@ export default function BrowsePage() {
                       setDeleteTarget({ path: node.path, repo: repoName, label: node.path, affectedPaths: paths })
                     }
                   }}
-                  onUsage={(node) => setUsageTarget({ format: selectedRepo?.format ?? 'raw', name: node.label })}
+                  onUsage={() => setSetupOpen(true)}
                   repoName={repoName}
                 />
               ))}
@@ -1606,7 +1770,7 @@ export default function BrowsePage() {
                     </div>
                     <div style={S.detailRow}>
                       <div style={S.detailLabel}>Path</div>
-                      <div style={{ ...S.detailValue, fontFamily: 'monospace', color: '#93c5fd' }}>{node.path}</div>
+                      <div style={{ ...S.detailValue, fontFamily: 'monospace', color: 'var(--holo-c-blue-300)' }}>{node.path}</div>
                     </div>
                     <div style={S.detailRow}>
                       <div style={S.detailLabel}>Content type</div>
@@ -1618,7 +1782,7 @@ export default function BrowsePage() {
                     </div>
                     <div style={S.detailRow}>
                       <div style={S.detailLabel}>SHA256</div>
-                      <div style={{ ...S.detailValue, fontFamily: 'monospace', fontSize: 10, color: '#93c5fd' }}>{node.sha256 || '—'}</div>
+                      <div style={{ ...S.detailValue, fontFamily: 'monospace', fontSize: 10, color: 'var(--holo-c-blue-300)' }}>{node.sha256 || '—'}</div>
                     </div>
                     <div style={S.detailRow}>
                       <div style={S.detailLabel}>Uploaded</div>
@@ -1629,25 +1793,14 @@ export default function BrowsePage() {
                       <div style={S.detailValue}>{repoName}</div>
                     </div>
                     <div style={S.detailActions}>
-                      <PanelBtn variant="primary" onClick={() => {
-                        void apiClient.get(downloadUrl, { responseType: 'blob' }).then((res) => {
-                          const url = window.URL.createObjectURL(res.data as Blob)
-                          const a = document.createElement('a')
-                          a.href = url
-                          a.download = node.label
-                          document.body.appendChild(a)
-                          a.click()
-                          document.body.removeChild(a)
-                          window.URL.revokeObjectURL(url)
-                        })
-                      }}>
+                      <PanelBtn variant="primary" onClick={() => { void downloadAsBlob(downloadUrl, node.label) }}>
                         <Download size={13} /> Download
                       </PanelBtn>
                       <PanelBtn onClick={() => { void navigator.clipboard.writeText(copyUrl) }}>
                         <Link size={13} /> Copy link
                       </PanelBtn>
-                      <PanelBtn onClick={() => setUsageTarget({ format: selectedRepo?.format ?? 'raw', name: node.label })}>
-                        <BookOpen size={13} /> Usage
+                      <PanelBtn onClick={() => setSetupOpen(true)}>
+                        <Terminal size={13} /> Set me up
                       </PanelBtn>
                       {signedIn && node.componentId && (
                         <PanelBtn onClick={async () => {
@@ -1681,7 +1834,7 @@ export default function BrowsePage() {
       ) : isError && (componentsError as { response?: { status?: number } })?.response?.status === 403 ? (
         <div style={S.empty}>
           <Package size={40} style={{ opacity: 0.3 }} />
-          <p style={{ color: '#ef4444' }}>Access denied — you don't have permission to browse this repository.</p>
+          <p style={{ color: 'var(--holo-c-red)' }}>Access denied — you don't have permission to browse this repository.</p>
         </div>
       ) : isLoading ? (
         <div style={S.empty}>Loading…</div>
@@ -1694,7 +1847,7 @@ export default function BrowsePage() {
         <>
           {signedIn && selectedComponentIDs.size > 0 && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px', background: 'rgba(59,130,246,0.1)', borderRadius: 8, marginBottom: 8, border: '1px solid rgba(59,130,246,0.3)', flexShrink: 0 }}>
-              <span style={{ fontSize: 13, color: '#93c5fd' }}>{selectedComponentIDs.size} selected</span>
+              <span style={{ fontSize: 13, color: 'var(--holo-c-blue-300)' }}>{selectedComponentIDs.size} selected</span>
               <HoloButton variant="primary" onClick={async () => {
                 const ids = Array.from(selectedComponentIDs)
                 try {
@@ -1711,7 +1864,8 @@ export default function BrowsePage() {
               <HoloButton onClick={() => setSelectedComponentIDs(new Set())}>Clear</HoloButton>
             </div>
           )}
-          <div className="holo-card" style={S.table}>
+          <div style={S.dockerLayout}>
+          <div className="holo-card" style={{ ...S.table, flex: '2 1 480px', minWidth: 0, maxWidth: '100%' }}>
             <div style={S.thead}>
               <div />
               <Truncated text="Name" />
@@ -1724,7 +1878,7 @@ export default function BrowsePage() {
               <div />
             </div>
             {items.map((c) => {
-              const color = FORMAT_COLORS[c.format] ?? '#6b7280'
+              const color = FORMAT_COLORS[c.format] ?? 'var(--holo-c-gray)'
               const firstAsset = c.assets?.[0]
               // Delete targets asset paths only. Falling back to the component
               // name produced a prefix that matched nothing (npm) or an empty
@@ -1747,18 +1901,41 @@ export default function BrowsePage() {
                 : '—'
               const isHighlighted = (!!highlightComponentId && c.id === highlightComponentId) ||
                 (!!highlightAssetPath && !!c.assets?.some((a) => a.path === highlightAssetPath))
+              const isOpen = detailComponentId === c.id
               return (
                 <div
                   key={c.id}
                   ref={isHighlighted ? highlightRowRef : undefined}
+                  // A click inspects; Promote stays on the checkbox (#535).
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Details for ${c.name}${c.version ? ` ${c.version}` : ''}`}
+                  aria-expanded={isOpen}
+                  onClick={() => setDetailComponentId(c.id)}
+                  onKeyDown={(e) => {
+                    // Keys typed on the checkbox or the delete button belong to them.
+                    if (e.target !== e.currentTarget) return
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      setDetailComponentId(c.id)
+                    }
+                  }}
                   style={{
                     ...S.trow,
+                    cursor: 'pointer',
                     ...(isHighlighted
                       ? { outline: '1px solid rgba(59,130,246,0.6)', background: 'rgba(59,130,246,0.08)' }
                       : {}),
+                    ...(isOpen
+                      ? { outline: '1px solid var(--holo-border-strong)', background: 'var(--holo-bg-3)' }
+                      : {}),
                   }}
                 >
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                    // The selection cell is the Promote affordance, not a way to open details.
+                    onClick={(e) => e.stopPropagation()}
+                  >
                     {signedIn && <input
                       type="checkbox"
                       checked={selectedComponentIDs.has(c.id)}
@@ -1768,7 +1945,8 @@ export default function BrowsePage() {
                         else next.delete(c.id)
                         setSelectedComponentIDs(next)
                       }}
-                      style={{ cursor: 'pointer', accentColor: '#3b82f6' }}
+                      aria-label={`Select ${c.name}${c.version ? ` ${c.version}` : ''} for promotion`}
+                      style={{ cursor: 'pointer', accentColor: 'var(--holo-c-blue)' }}
                     />}
                   </div>
                   <Truncated text={c.name} style={{ fontWeight: 600, color: 'var(--holo-text)' }} />
@@ -1786,7 +1964,7 @@ export default function BrowsePage() {
                   <Truncated text={formatPushDate(pushedAt)} style={S.muted} />
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                     {canDeleteRepo && (
-                      <GhostBtn danger onClick={() => setDeleteTarget({
+                      <GhostBtn danger onClick={(e) => { e.stopPropagation(); setDeleteTarget({
                         path: assetPaths[0] ?? '',
                         paths: assetPaths,
                         repo: repoName,
@@ -1794,7 +1972,7 @@ export default function BrowsePage() {
                         ...(assetPaths.length > 1
                           ? { affectedPaths: assetPaths, heading: 'Delete component?' }
                           : {}),
-                      })} title="Delete">
+                      }) }} title="Delete">
                         <Trash2 size={13} />
                       </GhostBtn>
                     )}
@@ -1803,58 +1981,38 @@ export default function BrowsePage() {
               )
             })}
           </div>
+          {detailComponent && (
+            <ComponentDetailPanel
+              key={detailComponent.id}
+              comp={detailComponent}
+              repoName={repoName}
+              onClose={() => setDetailComponentId(null)}
+            />
+          )}
+          </div>
 
           <div style={S.pager}>
-            <button style={S.pgBtn(page === 0)} disabled={page === 0} onClick={() => setPage((p) => p - 1)}>
+            <button style={S.pgBtn(page === 0)} disabled={page === 0} onClick={() => goToPage(page - 1)}>
               ← Prev
             </button>
             <span style={S.muted}>Page {page + 1}</span>
-            <button style={S.pgBtn(!hasNext)} disabled={!hasNext} onClick={() => setPage((p) => p + 1)}>
+            <button style={S.pgBtn(!hasNext)} disabled={!hasNext} onClick={() => goToPage(page + 1)}>
               Next →
             </button>
           </div>
         </>
       )}
 
-      <HoloModal open={!!usageTarget} onClose={() => setUsageTarget(null)}>
-        {usageTarget && (
-          <div style={{ minWidth: 380, display: 'flex', flexDirection: 'column', gap: 16 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <BookOpen size={20} style={{ color: '#93c5fd' }} />
-              <div>
-                <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--holo-text)' }}>Example Usage</div>
-                <div style={{ fontSize: 12, color: 'var(--holo-text-faint)', marginTop: 2 }}>
-                  {usageTarget.format} · {usageTarget.name}
-                </div>
-              </div>
-            </div>
-            <div style={{
-              padding: '28px 16px',
-              background: 'rgba(255,255,255,0.03)',
-              border: '1px solid rgba(255,255,255,0.07)',
-              borderRadius: 8,
-              textAlign: 'center' as const,
-              color: 'var(--holo-text-faint)',
-              fontSize: 13,
-            }}>
-              <Package size={28} style={{ opacity: 0.3, display: 'block', margin: '0 auto 10px' }} />
-              Documentation coming soon
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-              <HoloButton onClick={() => setUsageTarget(null)}>Close</HoloButton>
-            </div>
-          </div>
-        )}
-      </HoloModal>
+      <SetMeUpDialog repo={setupOpen ? selectedRepo ?? null : null} onClose={() => setSetupOpen(false)} />
 
       <HoloModal open={!!deleteTarget} onClose={() => { setDeleteTarget(null); setDeleteError(null) }}>
           {deleteTarget && <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: 'var(--holo-text)', display: 'flex', alignItems: 'center', gap: 8 }}>
-              <Trash2 size={17} style={{ color: '#ef4444' }} />
+              <Trash2 size={17} style={{ color: 'var(--holo-c-red)' }} />
               {deleteTarget.heading ?? (deleteTarget.affectedPaths ? 'Delete folder?' : 'Delete file?')}
             </h3>
             <div style={{ fontSize: 13, color: 'var(--holo-text-dim)' }}>
-              <span style={{ fontFamily: 'monospace', color: '#fca5a5', fontSize: 12 }}>{deleteTarget.label ?? deleteTarget.path}</span>
+              <span style={{ fontFamily: 'monospace', color: 'var(--holo-c-red-300)', fontSize: 12 }}>{deleteTarget.label ?? deleteTarget.path}</span>
               {deleteTarget.affectedPaths && (
                 <p style={{ margin: '8px 0 0', fontSize: 12, color: 'var(--holo-text-faint)' }}>
                   {deleteTarget.heading
@@ -1878,7 +2036,7 @@ export default function BrowsePage() {
                 flexDirection: 'column' as const,
                 gap: 3,
               }}>
-                <div style={{ fontSize: 11, color: 'rgba(239,68,68,0.7)', fontFamily: 'system-ui', fontWeight: 600, marginBottom: 4 }}>
+                <div style={{ fontSize: 11, color: 'var(--holo-tx-red-70)', fontFamily: 'system-ui', fontWeight: 600, marginBottom: 4 }}>
                   {deleteTarget.affectedPaths.length} files affected
                 </div>
                 {deleteTarget.affectedPaths.map((p) => (
@@ -1890,7 +2048,7 @@ export default function BrowsePage() {
               This action cannot be undone.
             </p>
             {deleteError && (
-              <div style={{ padding: '8px 12px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, color: '#ef4444', fontSize: 12 }}>{deleteError}</div>
+              <div style={{ padding: '8px 12px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, color: 'var(--holo-c-red)', fontSize: 12 }}>{deleteError}</div>
             )}
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
               <HoloButton onClick={() => { setDeleteTarget(null); setDeleteError(null) }} disabled={deleting}>
@@ -1909,7 +2067,7 @@ export default function BrowsePage() {
             Promote {promoteComponentIDs.length} component(s)
           </h3>
           {promotionRules.length === 0 ? (
-            <div style={{ color: '#64748b', fontSize: 13 }}>No promotion rules available for this repository.</div>
+            <div style={{ color: 'var(--holo-c-slate-500)', fontSize: 13 }}>No promotion rules available for this repository.</div>
           ) : (
             <>
               <div>
@@ -1922,7 +2080,7 @@ export default function BrowsePage() {
                 />
               </div>
               {promotionResult && (
-                <div style={{ fontSize: 13, color: promotionResult.startsWith('Error') ? '#ef4444' : '#4ade80' }}>
+                <div style={{ fontSize: 13, color: promotionResult.startsWith('Error') ? 'var(--holo-c-red)' : 'var(--holo-c-green-400)' }}>
                   {promotionResult}
                 </div>
               )}
@@ -1936,12 +2094,19 @@ export default function BrowsePage() {
                         rule_id: selectedRuleID,
                         component_ids: promoteComponentIDs,
                       })
-                      const reqs = res.data.requests as { status: string }[]
+                      const reqs = res.data.requests as { status: string; error?: string; included_components?: number }[]
                       const rule = promotionRules.find(r => r.id === selectedRuleID)
-                      if (rule?.require_manual_approval) {
-                        setPromotionResult(`Approval requested for ${reqs.length} component(s). An admin must approve.`)
+                      // A Docker/OCI tag brings its digest manifest, config and
+                      // layers along (#541); say so, or "1 component" undersells it.
+                      const included = reqs.reduce((n, r) => n + (r.included_components ?? 0), 0)
+                      const withImage = included > 0 ? ` with ${included} image part(s) (manifests, config, layers)` : ''
+                      const failed = reqs.filter(r => r.status === 'failed')
+                      if (failed.length > 0) {
+                        setPromotionResult(`Error: ${failed.length} of ${reqs.length} promotion(s) failed: ${failed[0].error ?? 'unknown error'}`)
+                      } else if (rule?.require_manual_approval) {
+                        setPromotionResult(`Approval requested for ${reqs.length} component(s)${withImage}. An admin must approve.`)
                       } else {
-                        setPromotionResult(`Promoted ${reqs.length} component(s) successfully.`)
+                        setPromotionResult(`Promoted ${reqs.length} component(s)${withImage} successfully.`)
                       }
                       setSelectedComponentIDs(new Set())
                     } catch (e: unknown) {
@@ -2071,7 +2236,7 @@ function RawUploadModal({
           {file ? (
             <>
               <div style={{ fontSize: 28, marginBottom: 8 }}>📦</div>
-              <div style={{ fontSize: 14, fontWeight: 600, color: '#93c5fd' }}>{file.name}</div>
+              <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--holo-c-blue-300)' }}>{file.name}</div>
               <div style={{ fontSize: 11, color: 'var(--holo-text-faint)', marginTop: 3 }}>
                 {formatBytes(file.size)} · {file.type || 'application/octet-stream'}
               </div>
@@ -2107,8 +2272,8 @@ function RawUploadModal({
         {/* Progress bar */}
         {uploadState === 'uploading' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <div style={{ height: 4, background: 'rgba(255,255,255,0.08)', borderRadius: 2, overflow: 'hidden' }}>
-              <div style={{ height: '100%', background: 'linear-gradient(90deg, #3b82f6, #60a5fa)', borderRadius: 2, width: `${progress}%`, transition: 'width .3s' }} />
+            <div style={{ height: 4, background: 'rgba(var(--holo-ink-rgb), 0.08)', borderRadius: 2, overflow: 'hidden' }}>
+              <div style={{ height: '100%', background: 'linear-gradient(90deg, var(--holo-c-blue), var(--holo-c-blue-400))', borderRadius: 2, width: `${progress}%`, transition: 'width .3s' }} />
             </div>
             <div style={{ fontSize: 11, color: 'var(--holo-text-faint)', display: 'flex', justifyContent: 'space-between' }}>
               <span>Uploading…</span>
@@ -2119,15 +2284,15 @@ function RawUploadModal({
 
         {/* Success */}
         {uploadState === 'done' && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 12px', background: 'rgba(34,197,94,0.1)', border: '1px solid rgba(34,197,94,0.3)', borderRadius: 8, fontSize: 13, color: '#86efac' }}>
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#86efac" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 12px', background: 'rgba(34,197,94,0.1)', border: '1px solid rgba(34,197,94,0.3)', borderRadius: 8, fontSize: 13, color: 'var(--holo-c-green-300)' }}>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--holo-c-green-300)" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
             File uploaded successfully
           </div>
         )}
 
         {/* Error */}
         {uploadState === 'error' && uploadError && (
-          <div style={{ padding: '8px 12px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, color: '#ef4444', fontSize: 12 }}>
+          <div style={{ padding: '8px 12px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, color: 'var(--holo-c-red)', fontSize: 12 }}>
             {uploadError}
           </div>
         )}

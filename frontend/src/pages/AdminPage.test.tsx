@@ -55,6 +55,20 @@ describe('AdminPage — Info tab', () => {
     expect(screen.getAllByText('Docker Subdomain Connector').length).toBeGreaterThan(0)
   })
 
+  it('states the check time once and survives a status without one', async () => {
+    server.use(
+      http.get('/api/v1/system/services', () =>
+        HttpResponse.json([
+          { name: 'PostgreSQL', status: 'ok', latency_ms: 12, detail: 'connected', checked_at: '2026-09-22T08:31:52Z' },
+          { name: 'Docker Subdomain Connector', status: 'ok', detail: 'Active *.docker.example.com', checked_at: '' },
+        ]),
+      ),
+    )
+    renderAdmin('info')
+    expect(await screen.findByText(/^Checked /)).toBeInTheDocument()
+    expect(screen.queryByText(/Invalid Date/)).not.toBeInTheDocument()
+  })
+
   it('shows offline status and disabled docker connector', async () => {
     server.use(
       http.get('/service/rest/v1/status', () => HttpResponse.json({ status: 'down' })),
@@ -658,6 +672,134 @@ describe('AdminPage — Backup tab', () => {
     fireEvent.click(screen.getByTitle('Clear'))
     await waitFor(() => expect(screen.queryByText('repo.tar.gz')).not.toBeInTheDocument())
   })
+
+  const backupStores = [
+    { id: 'bs-backups', name: 'backups', type: 's3', usedBytes: 0 },
+    { id: 'bs-group', name: 'grp', type: 'group', usedBytes: 0 },
+  ]
+
+  it('loads scheduled backup settings and lists only non-group stores', async () => {
+    server.use(
+      http.get('/service/rest/v1/blobstores', () => HttpResponse.json(backupStores)),
+      http.get('/api/v1/backup/settings', () =>
+        HttpResponse.json({ enabled: true, scheduleCron: '0 4 * * *', blobStoreId: 'bs-backups', retentionCount: 3 }),
+      ),
+    )
+    renderAdmin('backup')
+    expect(await screen.findByDisplayValue('0 4 * * *')).toBeInTheDocument()
+    expect(screen.getByLabelText('Enabled')).toBeChecked()
+    expect(screen.getByDisplayValue('backups (s3)')).toBeInTheDocument()
+    expect(screen.getByRole('spinbutton')).toHaveValue(3)
+    expect(screen.queryByRole('option', { name: 'grp (group)' })).not.toBeInTheDocument()
+  })
+
+  it('saves scheduled backup settings with the edited values', async () => {
+    const user = userEvent.setup()
+    let body: unknown
+    server.use(
+      http.get('/service/rest/v1/blobstores', () => HttpResponse.json(backupStores)),
+      http.put('/api/v1/backup/settings', async ({ request }) => {
+        body = await request.json()
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    renderAdmin('backup')
+    await screen.findByText('Scheduled Backup')
+    await user.click(screen.getByLabelText('Enabled'))
+    const cron = screen.getByDisplayValue('0 3 * * *')
+    await user.clear(cron)
+    await user.type(cron, '0 1 * * *')
+    await screen.findByRole('option', { name: 'backups (s3)' })
+    await user.selectOptions(screen.getByDisplayValue('Select a blob store…'), 'bs-backups')
+    const keep = screen.getByRole('spinbutton')
+    await user.clear(keep)
+    await user.type(keep, '2')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByText('Saved')).toBeInTheDocument()
+    expect(body).toEqual({ enabled: true, scheduleCron: '0 1 * * *', blobStoreId: 'bs-backups', retentionCount: 2 })
+  })
+
+  it('will not save an enabled schedule without a destination store', async () => {
+    const user = userEvent.setup()
+    renderAdmin('backup')
+    await screen.findByText('Scheduled Backup')
+    await user.click(screen.getByLabelText('Enabled'))
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(screen.getByText('Pick a destination blob store to enable scheduling.')).toBeInTheDocument()
+  })
+
+  it('shows the server error when saving is rejected', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.get('/service/rest/v1/blobstores', () => HttpResponse.json(backupStores)),
+      http.put('/api/v1/backup/settings', () =>
+        HttpResponse.json({ error: 'invalid scheduleCron "* * * *"' }, { status: 400 }),
+      ),
+    )
+    renderAdmin('backup')
+    await screen.findByText('Scheduled Backup')
+    await screen.findByRole('option', { name: 'backups (s3)' })
+    await user.selectOptions(screen.getByDisplayValue('Select a blob store…'), 'bs-backups')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('invalid scheduleCron "* * * *"')
+    expect(screen.queryByText('Saved')).not.toBeInTheDocument()
+  })
+
+  it('will not save an emptied "Keep last N" as keep-all', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.get('/api/v1/backup/settings', () => HttpResponse.json({ enabled: false, scheduleCron: '0 3 * * *', retentionCount: 3 })),
+    )
+    renderAdmin('backup')
+    // Wait for the loaded settings, or they would overwrite the edit below.
+    await waitFor(() => expect(screen.getByRole('spinbutton')).toHaveValue(3))
+    await user.clear(screen.getByRole('spinbutton'))
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(screen.getByText('Enter how many backups to keep — 0 keeps all of them.')).toBeInTheDocument()
+    await user.type(screen.getByRole('spinbutton'), '0')
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
+  })
+
+  it('does not call a restore that dropped blobs complete', async () => {
+    server.use(
+      http.post('/api/v1/backup/restore', () => HttpResponse.json({ restored: { repositories: 1, blobs: 2, blobsFailed: 3 } })),
+    )
+    renderAdmin('backup')
+    await screen.findByText('System Backup & Restore')
+    const fileInput = document.querySelector('input[type="file"][accept=".tar.gz,.tgz"]') as HTMLInputElement
+    fireEvent.change(fileInput, { target: { files: [new File(['x'], 'b.tar.gz')] } })
+    expect(await screen.findByText(/Restore finished with errors/)).toBeInTheDocument()
+    expect(screen.queryByText('Restore complete')).not.toBeInTheDocument()
+  })
+
+  it('says which imported blobs could not be written', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.post('/api/v1/repositories/import', () =>
+        HttpResponse.json({ imported: { repository: 'r', components: 1, assets: 0, blobs: 0, blobsFailed: 4, conflictMode: 'skip' } }),
+      ),
+    )
+    renderAdmin('backup')
+    await screen.findByText('Repository Import')
+    const importInput = document.querySelectorAll('input[type="file"][accept=".tar.gz,.tgz"]')[1] as HTMLInputElement
+    fireEvent.change(importInput, { target: { files: [new File(['x'], 'repo.tar.gz')] } })
+    await screen.findByText('repo.tar.gz')
+    await user.click(screen.getByRole('button', { name: /Import Repository/ }))
+    expect(await screen.findByText(/4 blobs could not be written/)).toBeInTheDocument()
+  })
+
+  it('shows the last scheduled run and its failure', async () => {
+    server.use(
+      http.get('/api/v1/backup/settings', () =>
+        HttpResponse.json({
+          enabled: true, scheduleCron: '0 3 * * *', retentionCount: 7,
+          lastRunAt: '2026-09-24T03:00:00Z', lastRunError: 'destination blob store was deleted',
+        }),
+      ),
+    )
+    renderAdmin('backup')
+    expect(await screen.findByText(/failed: destination blob store was deleted/)).toBeInTheDocument()
+  })
 })
 
 describe('AdminPage — Routing Rules tab', () => {
@@ -1016,6 +1158,206 @@ describe('AdminPage — Promotion tab', () => {
     const delBtns = screen.getAllByRole('button', { name: /^Delete$/ })
     await user.click(delBtns[delBtns.length - 1])
     await waitFor(() => expect(deleted).toBe(true))
+  })
+
+  // #543: the severities that fail require_scan_pass are chosen per rule.
+  describe('scan fail severities', () => {
+    type RulePayload = { require_scan_pass: boolean; scan_fail_severities: string[] }
+    const reposHandler = http.get('/service/rest/v1/repositories', () =>
+      HttpResponse.json([fixtures.repository({ name: 'maven-hosted' }), fixtures.repository({ id: 'r2', name: 'maven-release' })]),
+    )
+    const sevBox = (name: string) => screen.getByRole('checkbox', { name })
+
+    const openCreate = async (user: ReturnType<typeof userEvent.setup>) => {
+      renderAdmin('promotion')
+      await screen.findByText('No promotion rules configured')
+      await user.click(screen.getByRole('button', { name: /Create Rule/ }))
+      await screen.findByText('Create Promotion Rule')
+      await user.type(screen.getByPlaceholderText('promote-to-release'), 'new-rule')
+      await user.click(screen.getByRole('button', { name: /Select source repository/ }))
+      await user.click((await screen.findAllByText('maven-hosted'))[0])
+      await user.click(screen.getByRole('button', { name: /Select target repository/ }))
+      await user.click((await screen.findAllByText('maven-release'))[0])
+    }
+
+    it('defaults to malicious/critical/high and posts the chosen set', async () => {
+      const user = userEvent.setup()
+      let posted: RulePayload | null = null
+      server.use(
+        http.get('/api/v1/promotion/rules', () => HttpResponse.json([])),
+        http.get('/api/v1/promotion/requests', () => HttpResponse.json([])),
+        reposHandler,
+        http.post('/api/v1/promotion/rules', async ({ request }) => {
+          posted = (await request.json()) as RulePayload
+          return HttpResponse.json(promRule, { status: 201 })
+        }),
+      )
+      await openCreate(user)
+      expect(screen.queryByText('FAIL ON SEVERITIES')).not.toBeInTheDocument()
+      await user.click(screen.getByRole('checkbox', { name: /Require scan pass/ }))
+      expect(screen.getByText('FAIL ON SEVERITIES')).toBeInTheDocument()
+      expect(sevBox('MALICIOUS')).toBeChecked()
+      expect(sevBox('CRITICAL')).toBeChecked()
+      expect(sevBox('HIGH')).toBeChecked()
+      expect(sevBox('MEDIUM')).not.toBeChecked()
+      expect(sevBox('LOW')).not.toBeChecked()
+      expect(sevBox('UNKNOWN')).not.toBeChecked()
+
+      await user.click(sevBox('HIGH'))
+      await user.click(sevBox('MEDIUM'))
+      await user.click(screen.getByRole('button', { name: /^Create$/ }))
+      await waitFor(() => expect(posted).toBeTruthy())
+      expect(posted!.require_scan_pass).toBe(true)
+      expect(posted!.scan_fail_severities).toEqual(['malicious', 'critical', 'medium'])
+    })
+
+    it('refuses to save with no severity selected', async () => {
+      const user = userEvent.setup()
+      let posted = false
+      server.use(
+        http.get('/api/v1/promotion/rules', () => HttpResponse.json([])),
+        http.get('/api/v1/promotion/requests', () => HttpResponse.json([])),
+        reposHandler,
+        http.post('/api/v1/promotion/rules', () => { posted = true; return HttpResponse.json(promRule, { status: 201 }) }),
+      )
+      await openCreate(user)
+      await user.click(screen.getByRole('checkbox', { name: /Require scan pass/ }))
+      for (const sev of ['MALICIOUS', 'CRITICAL', 'HIGH']) await user.click(sevBox(sev))
+      await user.click(screen.getByRole('button', { name: /^Create$/ }))
+      expect(await screen.findByText('Select at least one severity that fails the scan')).toBeInTheDocument()
+      expect(posted).toBe(false)
+    })
+
+    it('sends an empty list when the scan gate is off', async () => {
+      const user = userEvent.setup()
+      let posted: RulePayload | null = null
+      server.use(
+        http.get('/api/v1/promotion/rules', () => HttpResponse.json([])),
+        http.get('/api/v1/promotion/requests', () => HttpResponse.json([])),
+        reposHandler,
+        http.post('/api/v1/promotion/rules', async ({ request }) => {
+          posted = (await request.json()) as RulePayload
+          return HttpResponse.json(promRule, { status: 201 })
+        }),
+      )
+      await openCreate(user)
+      await user.click(screen.getByRole('button', { name: /^Create$/ }))
+      await waitFor(() => expect(posted).toBeTruthy())
+      expect(posted!.require_scan_pass).toBe(false)
+      expect(posted!.scan_fail_severities).toEqual([])
+    })
+
+    it('round-trips a rule\'s own severities through edit', async () => {
+      const user = userEvent.setup()
+      let put: RulePayload | null = null
+      const custom = { ...promRule, scan_fail_severities: ['critical', 'low'] }
+      server.use(
+        http.get('/api/v1/promotion/rules', () => HttpResponse.json([custom])),
+        http.get('/api/v1/promotion/requests', () => HttpResponse.json([])),
+        reposHandler,
+        http.put('/api/v1/promotion/rules/:id', async ({ request }) => {
+          put = (await request.json()) as RulePayload
+          return HttpResponse.json(custom)
+        }),
+      )
+      renderAdmin('promotion')
+      await screen.findByText('to-release')
+      expect(screen.getByText('Scan Pass')).toHaveAttribute('title', 'Fails on: critical, low')
+      await user.click(screen.getByRole('button', { name: /Edit/ }))
+      await screen.findByText('Edit — to-release')
+      expect(sevBox('MALICIOUS')).not.toBeChecked()
+      expect(sevBox('CRITICAL')).toBeChecked()
+      expect(sevBox('HIGH')).not.toBeChecked()
+      expect(sevBox('LOW')).toBeChecked()
+      await user.click(screen.getByRole('button', { name: /^Save$/ }))
+      await waitFor(() => expect(put).toBeTruthy())
+      expect(put!.scan_fail_severities).toEqual(['critical', 'low'])
+    })
+
+    it('shows the default set for a rule without its own list', async () => {
+      const user = userEvent.setup()
+      server.use(
+        http.get('/api/v1/promotion/rules', () => HttpResponse.json([promRule])),
+        http.get('/api/v1/promotion/requests', () => HttpResponse.json([])),
+        reposHandler,
+      )
+      renderAdmin('promotion')
+      await screen.findByText('to-release')
+      expect(screen.getByText('Scan Pass')).toHaveAttribute('title', 'Fails on: malicious, critical, high')
+      await user.click(screen.getByRole('button', { name: /Edit/ }))
+      await screen.findByText('Edit — to-release')
+      expect(sevBox('MALICIOUS')).toBeChecked()
+      expect(sevBox('CRITICAL')).toBeChecked()
+      expect(sevBox('HIGH')).toBeChecked()
+      expect(sevBox('MEDIUM')).not.toBeChecked()
+    })
+  })
+
+  // #542: a rule can start by itself on publish.
+  describe('automatic promotion', () => {
+    type RulePayload = { auto_promote: boolean }
+    const reposHandler = http.get('/service/rest/v1/repositories', () =>
+      HttpResponse.json([fixtures.repository({ name: 'maven-hosted' }), fixtures.repository({ id: 'r2', name: 'maven-release' })]),
+    )
+    const autoBox = () => screen.getByRole('checkbox', { name: /Promote automatically on publish/ })
+
+    it('is off by default and posts the choice', async () => {
+      const user = userEvent.setup()
+      let posted: RulePayload | null = null
+      server.use(
+        http.get('/api/v1/promotion/rules', () => HttpResponse.json([])),
+        http.get('/api/v1/promotion/requests', () => HttpResponse.json([])),
+        reposHandler,
+        http.post('/api/v1/promotion/rules', async ({ request }) => {
+          posted = (await request.json()) as RulePayload
+          return HttpResponse.json(promRule, { status: 201 })
+        }),
+      )
+      renderAdmin('promotion')
+      await screen.findByText('No promotion rules configured')
+      await user.click(screen.getByRole('button', { name: /Create Rule/ }))
+      await screen.findByText('Create Promotion Rule')
+      await user.type(screen.getByPlaceholderText('promote-to-release'), 'auto-rule')
+      await user.click(screen.getByRole('button', { name: /Select source repository/ }))
+      await user.click((await screen.findAllByText('maven-hosted'))[0])
+      await user.click(screen.getByRole('button', { name: /Select target repository/ }))
+      await user.click((await screen.findAllByText('maven-release'))[0])
+      expect(autoBox()).not.toBeChecked()
+      expect(screen.getByText(/starts this rule by itself/)).toBeInTheDocument()
+      await user.click(autoBox())
+      await user.click(screen.getByRole('button', { name: /^Create$/ }))
+      await waitFor(() => expect(posted).toBeTruthy())
+      expect(posted!.auto_promote).toBe(true)
+    })
+
+    it('badges an automatic rule, keeps the flag through edit, and marks automatic requests', async () => {
+      const user = userEvent.setup()
+      let put: RulePayload | null = null
+      const autoRule = { ...promRule, auto_promote: true }
+      const autoReq = {
+        ...promReq, id: 'req-2', status: 'failed', automatic: true, requested_by: '',
+        error: 'automatic promotion blocked: scan has 1 high findings',
+      }
+      server.use(
+        http.get('/api/v1/promotion/rules', () => HttpResponse.json([autoRule])),
+        http.get('/api/v1/promotion/requests', () => HttpResponse.json([autoReq])),
+        reposHandler,
+        http.put('/api/v1/promotion/rules/:id', async ({ request }) => {
+          put = (await request.json()) as RulePayload
+          return HttpResponse.json(autoRule)
+        }),
+      )
+      renderAdmin('promotion')
+      expect(await screen.findByText('Auto on Publish')).toBeInTheDocument()
+      expect(await screen.findByText('Auto')).toHaveAttribute('title', 'Filed automatically on publish')
+      expect(screen.getByText('failed')).toHaveAttribute('title', autoReq.error)
+      await user.click(screen.getByRole('button', { name: /Edit/ }))
+      await screen.findByText('Edit — to-release')
+      expect(autoBox()).toBeChecked()
+      await user.click(screen.getByRole('button', { name: /^Save$/ }))
+      await waitFor(() => expect(put).toBeTruthy())
+      expect(put!.auto_promote).toBe(true)
+    })
   })
 })
 

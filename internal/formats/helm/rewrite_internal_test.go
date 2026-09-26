@@ -106,10 +106,10 @@ func TestRewriteChartURL(t *testing.T) {
 			want:       local + "x-1.0.0.tgz",
 		},
 		{
-			// The download handler recovers the origin from the minted filename, so
-			// an off-host chart is proxied under the entry's own coordinates. Taking
-			// the origin's basename here made "widget.tgz" split into version 0.0.0
-			// and the index lookup miss — a 404 on a chart that used to be reachable.
+			// The download handler recovers the origin by the rewritten local path,
+			// so an off-host chart is proxied under the entry's own coordinates.
+			// Taking the origin's basename here made "widget.tgz" collide with any
+			// other entry of that name and file the component at version 0.0.0.
 			name:       "off-host origin is proxied under the entry's canonical name",
 			remoteBase: "https://charts.example.com",
 			url:        "https://github.com/o/r/releases/download/v1.0.0/widget.tgz",

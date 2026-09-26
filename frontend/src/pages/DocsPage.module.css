@@ -44,7 +44,7 @@
 }
 
 .docsNavBtn:hover {
-  background: rgba(255,255,255,0.04);
+  background: rgba(var(--holo-ink-rgb), 0.04);
   color: var(--holo-text);
 }
 
@@ -137,72 +137,6 @@
   background: rgba(34,211,238,0.15);
 }
 
-.codeBlock {
-  background: rgba(0,0,0,0.35);
-  border: 1px solid var(--holo-border);
-  border-radius: 10px;
-  overflow: hidden;
-  margin-bottom: 12px;
-}
-
-.codeHeader {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 5px 12px;
-  background: rgba(255,255,255,0.02);
-  border-bottom: 1px solid var(--holo-border);
-}
-
-.codeLang {
-  font-size: 10px;
-  font-weight: 700;
-  color: var(--holo-a);
-  font-family: 'Geist Mono', monospace;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-}
-
-.copyBtn {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 8px;
-  border-radius: 5px;
-  border: 1px solid rgba(124,92,255,0.25);
-  background: rgba(124,92,255,0.08);
-  color: var(--holo-text-dim);
-  font-size: 11px;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-
-.copyBtn:hover {
-  background: rgba(124,92,255,0.15);
-  color: var(--holo-text);
-}
-
-.copyBtn.copied {
-  color: #5effb8;
-  border-color: rgba(94,255,184,0.30);
-  background: rgba(94,255,184,0.08);
-}
-
-.codeBody {
-  padding: 14px 16px;
-  overflow-x: auto;
-  scrollbar-width: thin;
-}
-
-.codeBody pre {
-  margin: 0;
-  font-family: 'Geist Mono', 'Fira Code', 'Cascadia Code', monospace;
-  font-size: 12.5px;
-  line-height: 1.65;
-  color: #e2e8f0;
-  white-space: pre;
-}
-
 .codeLabel {
   font-size: 12px;
   color: var(--holo-text-faint);
@@ -221,7 +155,7 @@
   border: 1px solid rgba(255,200,87,0.20);
   border-radius: 8px;
   font-size: 13px;
-  color: #ffc857;
+  color: var(--holo-amber);
   margin-bottom: 12px;
   line-height: 1.5;
 }
@@ -246,7 +180,7 @@
   width: 28px;
   height: 28px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #7c5cff, #22d3ee);
+  background: linear-gradient(135deg, var(--holo-a), var(--holo-b));
   color: #fff;
   font-size: 12px;
   font-weight: 700;
@@ -296,7 +230,7 @@
   text-align: center;
   padding: 5px 0;
   font-style: italic;
-  background: rgba(255,255,255,0.015);
+  background: rgba(var(--holo-ink-rgb), 0.015);
   border-top: 1px solid var(--holo-border);
 }
 
@@ -318,7 +252,7 @@
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: rgba(124,92,255,0.6);
+  color: var(--holo-tx-purple-60);
 }
 
 .screenshotPlaceholderName {
@@ -330,7 +264,7 @@
 .screenshotPlaceholderPath {
   font-family: 'Geist Mono', monospace;
   font-size: 10px;
-  color: rgba(124,92,255,0.4);
+  color: var(--holo-tx-purple-40);
   background: rgba(124,92,255,0.08);
   padding: 2px 8px;
   border-radius: 4px;
@@ -348,7 +282,7 @@
   padding: 10px 12px;
   border-radius: 8px;
   border: 1px solid var(--holo-border);
-  background: rgba(255,255,255,0.02);
+  background: rgba(var(--holo-ink-rgb), 0.02);
 }
 
 .typeCardName {

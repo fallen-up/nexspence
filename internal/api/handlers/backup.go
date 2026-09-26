@@ -1,13 +1,18 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
+	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/repository"
 	"github.com/nexspence-oss/nexspence/internal/service"
 )
 
@@ -118,4 +123,86 @@ func (h *BackupHandler) ImportRepo(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"imported": stats})
+}
+
+// Settings serves GET /api/v1/backup/settings — the scheduled-backup config.
+func (h *BackupHandler) Settings(c *gin.Context) {
+	if h.svc.Settings == nil {
+		c.JSON(http.StatusOK, domain.BackupSettings{ScheduleCron: "0 3 * * *", RetentionCount: 7})
+		return
+	}
+	s, err := h.svc.Settings.Get(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, s)
+}
+
+// UpdateSettings serves PUT /api/v1/backup/settings. Saving reloads the cron
+// entry immediately — no restart needed for a schedule/destination change.
+func (h *BackupHandler) UpdateSettings(c *gin.Context) {
+	if h.svc.Settings == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "scheduled backup is not configured on this instance"})
+		return
+	}
+	var s domain.BackupSettings
+	if err := c.ShouldBindJSON(&s); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// Validate everything before Upsert: once saved, ReloadSchedule drops the
+	// current cron entry, so a bad value would silently stop a schedule that
+	// was working — and stay persisted across restarts.
+	if msg, status := h.validateBackupSettings(c.Request.Context(), &s); msg != "" {
+		c.JSON(status, gin.H{"error": msg})
+		return
+	}
+	if err := h.svc.Settings.Upsert(c.Request.Context(), &s); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save scheduled backup settings"})
+		return
+	}
+	if err := h.svc.ReloadSchedule(c.Request.Context()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "saved, but the schedule could not be reloaded: " + err.Error()})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// validateBackupSettings returns an error message and status for an invalid
+// PUT body, or "" when it is valid.
+func (h *BackupHandler) validateBackupSettings(ctx context.Context, s *domain.BackupSettings) (string, int) {
+	if s.RetentionCount < 0 {
+		return "retentionCount must be >= 0", http.StatusBadRequest
+	}
+	s.ScheduleCron = strings.TrimSpace(s.ScheduleCron)
+	if s.ScheduleCron == "" {
+		if s.Enabled {
+			return "scheduleCron is required when scheduling is enabled", http.StatusBadRequest
+		}
+	} else if err := service.ValidateSchedule(s.ScheduleCron); err != nil {
+		return fmt.Sprintf("invalid scheduleCron %q: %v", s.ScheduleCron, err), http.StatusBadRequest
+	}
+	if s.BlobStoreID == "" {
+		if s.Enabled {
+			return "blobStoreId is required when scheduling is enabled", http.StatusBadRequest
+		}
+		return "", 0
+	}
+	if _, err := uuid.Parse(s.BlobStoreID); err != nil {
+		return fmt.Sprintf("blob store %q not found", s.BlobStoreID), http.StatusBadRequest
+	}
+	bs, err := h.svc.BlobStores.GetByID(ctx, s.BlobStoreID)
+	if errors.Is(err, repository.ErrNotFound) || (err == nil && bs == nil) {
+		return fmt.Sprintf("blob store %q not found", s.BlobStoreID), http.StatusBadRequest
+	}
+	if err != nil {
+		return "failed to look up the destination blob store", http.StatusInternalServerError
+	}
+	if bs.Type == "group" {
+		// A group only picks a member per artifact write; a backup is not
+		// one, and the registry cannot open a group as a physical store.
+		return fmt.Sprintf("blob store %q is a group store: choose one of its member stores instead", bs.Name), http.StatusBadRequest
+	}
+	return "", 0
 }

@@ -6,8 +6,9 @@ package helm
 // index download per proxy member, and an index like Bitnami's is tens of
 // megabytes.
 //
-// So the origin lookup goes through a per-repository cache of name@version → url
-// and refetches only once the copy is older than helm.index_cache_ttl (5 minutes
+// So the origin lookup goes through a per-repository cache of rewritten local
+// path → origin URL (the same path fetchAndRewriteHelmIndex emits) and
+// refetches only once the copy is older than helm.index_cache_ttl (5 minutes
 // by default, 0 to fetch per lookup). Artifactory caches upstream metadata for 2
 // hours by default and Nexus for 24; minutes here is the conservative end of
 // that. The client-facing /index.yaml route stays live: the catalog a client
@@ -16,11 +17,16 @@ package helm
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/nexspence-oss/nexspence/internal/domain"
 )
+
+// originTableLocalBase is a dummy prefix rewriteChartURL needs so the cache can
+// recover the proxy-relative path it would emit into the served index.
+const originTableLocalBase = "http://nexspence.invalid/repository/_/"
 
 const (
 	// chartIndexErrorTTL is how long a failed fetch is remembered, so a burst of
@@ -33,12 +39,18 @@ const (
 	maxCachedIndexes = 64
 )
 
+// chartOrigin is one index.yaml entry as the download path needs it: the
+// rewritten local path is the map key; name/version file the cached component.
+type chartOrigin struct {
+	name, version, url string
+}
+
 // chartIndex is one repository's slot. Its lock is held across the upstream
 // fetch, so concurrent pulls (helm dependency update asks for several charts at
 // once) share one download instead of one each.
 type chartIndex struct {
 	mu     sync.Mutex
-	urls   map[string]string // "<name>@<version>" → first urls entry; never mutated once published
+	urls   map[string]chartOrigin // rewritten local path → origin; never mutated once published
 	urlsAt time.Time
 	err    error
 	errAt  time.Time
@@ -82,14 +94,14 @@ func (c *chartIndexCache) slot(key string) *chartIndex {
 
 // chartURLs returns repo's upstream chart URL table, fetching index.yaml when the
 // cached copy is missing or stale. The returned map is shared and read-only.
-func (h *Handler) chartURLs(ctx context.Context, repo *domain.Repository, remoteBase string) (map[string]string, error) {
+func (h *Handler) chartURLs(ctx context.Context, repo *domain.Repository, remoteBase string) (map[string]chartOrigin, error) {
 	ttl := h.deps.HelmIndexCacheTTL
 	if ttl <= 0 {
 		index, err := fetchHelmIndexDoc(ctx, repo, remoteBase)
 		if err != nil {
 			return nil, err
 		}
-		return chartURLTable(index), nil
+		return chartOriginTable(index, remoteBase), nil
 	}
 
 	e := h.indexes.slot(repo.ID + "\x00" + remoteBase)
@@ -104,22 +116,29 @@ func (h *Handler) chartURLs(ctx context.Context, repo *domain.Repository, remote
 		return nil, e.err
 	}
 
-	index, err := fetchHelmIndexDoc(ctx, repo, remoteBase)
+	// The first requester's cancel must not poison the slot: other pulls still
+	// need this index. The fetch itself is still bounded by fetchHelmIndexDoc's
+	// timeout. A failure that is just "the client hung up" is not cached.
+	index, err := fetchHelmIndexDoc(context.WithoutCancel(ctx), repo, remoteBase)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, err
+		}
 		e.urls, e.err, e.errAt = nil, err, time.Now()
 		return nil, err
 	}
-	e.urls, e.urlsAt, e.err = chartURLTable(index), time.Now(), nil
+	e.urls, e.urlsAt, e.err = chartOriginTable(index, remoteBase), time.Now(), nil
 	return e.urls, nil
 }
 
-// chartURLTable flattens an index.yaml document to name@version → first urls
-// entry. Entries without a usable URL are left out, so a lookup miss and "listed
-// but unfetchable" stay one answer. The first entry for a version wins, matching
-// how a client reading the same document resolves it.
-func chartURLTable(index map[string]any) map[string]string {
+// chartOriginTable flattens an index.yaml document to rewritten local path →
+// origin. The key is whatever rewriteChartURL would put in the served index, so
+// a same-host charts/widget.tgz and an off-host mint of widget-1.0.0.tgz both
+// round-trip. Entries without a usable URL, or that rewriteChartURL would hand
+// to the client raw, are left out. The first entry for a path wins.
+func chartOriginTable(index map[string]any, remoteBase string) map[string]chartOrigin {
 	entries, _ := index["entries"].(map[string]any)
-	table := make(map[string]string, len(entries))
+	table := make(map[string]chartOrigin, len(entries))
 	for key, raw := range entries {
 		charts, ok := raw.([]any)
 		if !ok {
@@ -143,8 +162,20 @@ func chartURLTable(index map[string]any) map[string]string {
 			if first == "" {
 				continue
 			}
-			if _, seen := table[name+"@"+version]; !seen {
-				table[name+"@"+version] = first
+			origin := resolvedUpstreamChartURL(first, remoteBase)
+			if origin == "" {
+				continue
+			}
+			rewritten := rewriteChartURL(first, remoteBase, originTableLocalBase, canonicalChartFile(chart, key))
+			if !strings.HasPrefix(rewritten, originTableLocalBase) {
+				continue
+			}
+			rel := strings.TrimPrefix(rewritten, originTableLocalBase)
+			if rel == "" {
+				continue
+			}
+			if _, seen := table[rel]; !seen {
+				table[rel] = chartOrigin{name: name, version: version, url: origin}
 			}
 		}
 	}

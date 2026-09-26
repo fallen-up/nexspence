@@ -3,6 +3,7 @@
 package domain
 
 import (
+	"regexp"
 	"time"
 )
 
@@ -77,6 +78,22 @@ func (f RepoFormat) IsOCIRegistry() bool {
 	return f == FormatDocker || f == FormatOCI
 }
 
+// dockerPathComponent is the distribution reference grammar for one path
+// component. Docker-family clients parse image references with it, so a
+// docker/oci repository whose name fails it exists but can never be pushed to
+// or pulled from — `docker tag host/<name>/img` is not even parseable. (#262
+// was found via a repository named "docker test", created without complaint
+// and then silently unusable.)
+var dockerPathComponent = regexp.MustCompile(`^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*$`)
+
+// IsDockerPathComponent reports whether name is one path component a
+// docker-family client can address. It is also what makes a name safe to
+// splice into a URL path: the grammar has no room for a slash, a "..", an
+// empty component or a leading/trailing separator.
+func IsDockerPathComponent(name string) bool {
+	return dockerPathComponent.MatchString(name)
+}
+
 // Repository is a hosted, proxy, or group artifact repository of a given format.
 type Repository struct {
 	ID               string         `json:"id"`
@@ -130,6 +147,64 @@ func GroupWritableMember(r *Repository) string {
 		return ""
 	}
 	v, _ := r.FormatConfig["writable_member"].(string)
+	return v
+}
+
+// WritePolicy decides whether client writes to a hosted repository may create
+// or replace assets (#539). It lives in formatConfig["write_policy"].
+type WritePolicy string
+
+const (
+	// WritePolicyAllow accepts every write, replacing whatever the path held.
+	// It is the default when the key is absent.
+	WritePolicyAllow WritePolicy = "allow"
+	// WritePolicyAllowOnce accepts the first write of a path and rejects every
+	// later one ("Disable redeploy").
+	WritePolicyAllowOnce WritePolicy = "allow_once"
+	// WritePolicyDeny rejects every client write ("Read-only").
+	WritePolicyDeny WritePolicy = "deny"
+)
+
+const (
+	// WritePolicyKey is the formatConfig key holding a hosted repository's WritePolicy.
+	WritePolicyKey = "write_policy"
+	// AllowRedeployLatestKey is the formatConfig key that, on a docker/oci hosted
+	// repository under WritePolicyAllowOnce, lets the "latest" tag be re-pushed.
+	AllowRedeployLatestKey = "allow_redeploy_latest"
+)
+
+// Valid reports whether p is one of the known policies.
+func (p WritePolicy) Valid() bool {
+	switch p {
+	case WritePolicyAllow, WritePolicyAllowOnce, WritePolicyDeny:
+		return true
+	}
+	return false
+}
+
+// RepoWritePolicy returns the write policy governing client writes to r. Only
+// hosted repositories carry one: proxy caches and groups always answer
+// WritePolicyAllow. An absent, empty or unrecognized value is WritePolicyAllow
+// — the service rejects unknown values on create and update, so an
+// unrecognized one can only come from a row edited behind the API's back.
+func RepoWritePolicy(r *Repository) WritePolicy {
+	if r == nil || r.Type != TypeHosted || r.FormatConfig == nil {
+		return WritePolicyAllow
+	}
+	v, _ := r.FormatConfig[WritePolicyKey].(string)
+	if p := WritePolicy(v); p.Valid() {
+		return p
+	}
+	return WritePolicyAllow
+}
+
+// RepoAllowsRedeployLatest reports whether an OCI-registry repository lets the
+// "latest" tag be replaced while its write policy is WritePolicyAllowOnce.
+func RepoAllowsRedeployLatest(r *Repository) bool {
+	if r == nil || r.FormatConfig == nil || !r.Format.IsOCIRegistry() {
+		return false
+	}
+	v, _ := r.FormatConfig[AllowRedeployLatestKey].(bool)
 	return v
 }
 
@@ -520,6 +595,20 @@ type CleanupPolicy struct {
 	UpdatedAt       time.Time      `json:"updatedAt"`
 }
 
+// BackupSettings is the (singleton) config for scheduled full-instance
+// backups. Retrieved via BackupSettingsRepo.Get, which always returns a
+// value (column defaults) even before the row has ever been written.
+type BackupSettings struct {
+	Enabled        bool       `json:"enabled"`
+	ScheduleCron   string     `json:"scheduleCron"`
+	BlobStoreID    string     `json:"blobStoreId,omitempty"`
+	RetentionCount int        `json:"retentionCount"`
+	LastRunAt      *time.Time `json:"lastRunAt,omitempty"`
+	LastRunKey     string     `json:"lastRunKey,omitempty"`
+	LastRunError   string     `json:"lastRunError,omitempty"`
+	UpdatedAt      time.Time  `json:"updatedAt"`
+}
+
 // CleanupPreviewAsset is a single asset returned by PreviewPolicy.
 type CleanupPreviewAsset struct {
 	Path           string     `json:"path"`
@@ -712,15 +801,19 @@ type ReplicationHistory struct {
 
 // PromotionRule defines a promotion route between two repositories.
 type PromotionRule struct {
-	ID                    string    `json:"id"`
-	Name                  string    `json:"name"`
-	FromRepo              string    `json:"from_repo"`
-	ToRepo                string    `json:"to_repo"`
-	PathFilter            string    `json:"path_filter,omitempty"` // CEL expression; empty = all paths
-	RequireScanPass       bool      `json:"require_scan_pass"`
-	RequireManualApproval bool      `json:"require_manual_approval"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	ID                    string   `json:"id"`
+	Name                  string   `json:"name"`
+	FromRepo              string   `json:"from_repo"`
+	ToRepo                string   `json:"to_repo"`
+	PathFilter            string   `json:"path_filter,omitempty"` // CEL expression; empty = all paths
+	RequireScanPass       bool     `json:"require_scan_pass"`
+	ScanFailSeverities    []string `json:"scan_fail_severities,omitempty"` // fail require_scan_pass; empty = DefaultScanFailSeverities (#543)
+	RequireManualApproval bool     `json:"require_manual_approval"`
+	// AutoPromote starts the rule by itself when a client publishes a matching
+	// component into FromRepo (#542). Every other gate still applies.
+	AutoPromote bool      `json:"auto_promote"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // PromotionStatus is the lifecycle state of a build-promotion request.
@@ -741,10 +834,46 @@ type PromotionRequest struct {
 	RuleID      string          `json:"rule_id"`
 	ComponentID string          `json:"component_id"`
 	Status      PromotionStatus `json:"status"`
-	RequestedBy string          `json:"requested_by"`
-	ReviewedBy  *string         `json:"reviewed_by,omitempty"`
-	ReviewedAt  *time.Time      `json:"reviewed_at,omitempty"`
-	CompletedAt *time.Time      `json:"completed_at,omitempty"`
-	Error       string          `json:"error,omitempty"`
-	CreatedAt   time.Time       `json:"created_at"`
+	// RequestedBy is the user who asked for the promotion; empty for an
+	// Automatic one, which no user filed.
+	RequestedBy string `json:"requested_by"`
+	// Automatic marks a request filed by auto-promotion on publish (#542)
+	// rather than by a Promote call.
+	Automatic bool `json:"automatic"`
+	// PublishedAt is, for an Automatic request, when the component was last
+	// published as of its last evaluation — the publish a scan must postdate
+	// for Approve to go ahead.
+	PublishedAt *time.Time `json:"published_at,omitempty"`
+	ReviewedBy  *string    `json:"reviewed_by,omitempty"`
+	ReviewedAt  *time.Time `json:"reviewed_at,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	Error       string     `json:"error,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	// IncludedComponents counts the components promoted along with this one
+	// because they belong to the same Docker/OCI image — digest alias, config
+	// and layer blobs, child manifests (#541). Reported by Promote only; it is
+	// not persisted, so listed requests carry zero.
+	IncludedComponents int `json:"included_components,omitempty"`
+}
+
+// AutoPromotionEntry is one queued evaluation of an auto_promote rule for a
+// component a client published into the rule's from_repo (#542).
+type AutoPromotionEntry struct {
+	ID          string
+	RuleID      string
+	ComponentID string
+	// LastPublishedAt is when the component last received an asset.
+	LastPublishedAt time.Time
+	DueAt           time.Time
+	// Generation changes with every publish into the component; a worker
+	// finishes only the generation it evaluated.
+	Generation int64
+	// Attempts counts transient failures only.
+	Attempts       int
+	WaitingForScan bool
+	// Started is whether this generation's start was audited.
+	Started bool
+	Reason  string
+	// ClaimToken names the claim this entry was handed out under.
+	ClaimToken string
 }

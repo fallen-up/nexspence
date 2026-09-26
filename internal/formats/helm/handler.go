@@ -68,7 +68,11 @@ func (h *Handler) ServeHTTP(c *gin.Context) {
 		if strings.HasSuffix(filename, ".tgz") {
 			chartName, version := splitChartFilename(filename)
 			coords = base.Coords{Name: chartName, Version: version}
-			upstream = h.proxyChartUpstream(c, repo, p, chartName, version)
+			u, name, ver := h.proxyChartUpstream(c, repo, p)
+			if name != "" {
+				coords = base.Coords{Name: name, Version: ver}
+			}
+			upstream = u
 			if c.Writer.Written() {
 				return
 			}
@@ -206,7 +210,7 @@ func (h *Handler) handleUpload(c *gin.Context, repoName, pathFilename string) {
 	if _, err := base.StoreArtifact(c.Request.Context(), h.deps,
 		repoName, filePath, "application/x-tar", coords,
 		bytes.NewReader(data), size); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(base.HTTPStatusForError(err), gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{"saved": true})
@@ -338,7 +342,7 @@ func splitChartFilename(filename string) (chartName, version string) {
 //     stripped and the remainder is treated as case 1;
 //  3. an absolute URL on another host (GitHub releases) or a sibling subtree of the
 //     same host — rewritten to localBase + canonicalFile so helm pull stays on this
-//     proxy, which then fetches the original URL (see originURLForChart) and caches
+//     proxy, which then fetches the original URL (see originForRequestPath) and caches
 //     the tarball. A query string still cannot round-trip and is left for the client.
 //  4. a root-relative path ("/charts/mychart-1.2.3.tgz"), which resolves against the
 //     HOST root and NOT the remote's path prefix — case 2 when it happens to land
@@ -406,12 +410,11 @@ func rewriteChartURL(rawURL, remoteBase, localBase, canonicalFile string) string
 
 // proxyViaBasename mints a proxy path for an origin URL we can fetch by its
 // absolute form (GitHub releases, a sibling subtree). The download handler
-// recovers the origin by splitting the filename back into chart coordinates and
-// looking them up in index.yaml, so the minted name is the entry's own
-// "<name>-<version>.tgz" — an origin named anything else ("widget.tgz",
-// "widget-v1.0.0.tgz" at version "1.0.0") would not survive that round trip and
-// would answer 404. Only an entry that fails to name its chart falls back to the
-// origin's basename.
+// recovers the origin by the rewritten local path, so the minted name is the
+// entry's own "<name>-<version>.tgz" — that keeps two off-host charts from
+// colliding on a shared basename ("widget.tgz") and files the cached component
+// under the entry's coordinates. Only an entry that fails to name its chart
+// falls back to the origin's basename.
 func proxyViaBasename(abs *url.URL, localBase, canonicalFile string, unproxyable func() string) string {
 	if abs.Scheme != "http" && abs.Scheme != "https" {
 		return unproxyable()
@@ -454,45 +457,53 @@ func (w forbidAsNotFound) WriteHeader(code int) {
 }
 
 // proxyChartUpstream returns the absolute origin URL ServeGET should fetch for
-// this chart, or empty to use the request path against remote_url. Writes 404
-// and returns "" when the upstream index is readable but does not list the chart
-// — so a Bitnami proxy is not asked for a Cilium tarball.
-func (h *Handler) proxyChartUpstream(c *gin.Context, repo *domain.Repository, reqPath, chartName, version string) string {
+// this chart, or empty to use the request path against remote_url. The origin is
+// looked up by the rewritten local path (the same path fetchAndRewriteHelmIndex
+// emits), so a same-host entry named charts/widget.tgz still round-trips. On a
+// group member, a readable index that does not list the path is a 404 — so a
+// Bitnami proxy is not asked for a Cilium tarball. A direct request falls
+// through to path forwarding: some remotes serve versions the index omits.
+func (h *Handler) proxyChartUpstream(c *gin.Context, repo *domain.Repository, reqPath string) (origin, name, version string) {
 	if h.deps.Assets != nil {
 		if _, err := h.deps.Assets.GetByPath(c.Request.Context(), repo.Name, reqPath); err == nil {
-			return ""
+			return "", "", ""
 		} else if !errors.Is(err, repository.ErrNotFound) {
-			return ""
+			return "", "", ""
 		}
 	}
-	origin, listed, indexOK := h.originURLForChart(c.Request.Context(), repo, chartName, version)
+	o, listed, indexOK := h.originForRequestPath(c.Request.Context(), repo, reqPath)
 	if indexOK && !listed {
-		c.JSON(http.StatusNotFound, gin.H{"error": "chart not in upstream index"})
-		return ""
+		if c.GetBool(formats.GroupMemberKey) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "chart not in upstream index"})
+			return "", "", ""
+		}
+		return "", "", ""
 	}
-	if !listed || origin == "" {
-		return ""
+	if !listed || o.url == "" {
+		return "", "", ""
 	}
+	origin = o.url
 	if strings.HasSuffix(reqPath, ".prov") {
-		return origin + ".prov"
+		origin += ".prov"
 	}
-	return origin
+	return origin, o.name, o.version
 }
 
-func (h *Handler) originURLForChart(ctx context.Context, repo *domain.Repository, chartName, version string) (origin string, listed, indexOK bool) {
+func (h *Handler) originForRequestPath(ctx context.Context, repo *domain.Repository, reqPath string) (o chartOrigin, listed, indexOK bool) {
 	remoteBase, err := repoproxy.RemoteURL(repo)
 	if err != nil {
-		return "", false, false
+		return chartOrigin{}, false, false
 	}
 	urls, err := h.chartURLs(ctx, repo, remoteBase)
 	if err != nil {
-		return "", false, false
+		return chartOrigin{}, false, false
 	}
-	raw := urls[chartName+"@"+version]
-	if raw == "" {
-		return "", false, true
+	rel := strings.TrimSuffix(strings.TrimPrefix(reqPath, "/"), ".prov")
+	o, ok := urls[rel]
+	if !ok {
+		return chartOrigin{}, false, true
 	}
-	return resolvedUpstreamChartURL(raw, remoteBase), true, true
+	return o, true, true
 }
 
 func fetchHelmIndexDoc(ctx context.Context, repo *domain.Repository, remoteBase string) (map[string]any, error) {
