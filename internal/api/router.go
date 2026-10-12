@@ -257,6 +257,7 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 	// every handler keeps a nil copy of it.
 	scanSvc := service.NewScanService(componentRepo, cfg.HTTP.BaseURL).
 		WithScanResults(scanRepo).
+		WithAssets(assetRepo).
 		WithScanCompleted(promotionSvc.NotifyScanned).
 		WithCredentials(cfg.Bootstrap.AdminUsername, cfg.Bootstrap.AdminPassword).
 		WithTrivy(service.TrivyOptions{
@@ -302,6 +303,11 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 		RBAC:         rbacSvc,
 		Scanner:      scanTrigger,
 		Publishes:    promotionSvc,
+		// The docker/oci pull gate (#641) judges a manifest by its latest scan
+		// and lets the scanner's own pulls through — the account scanSvc
+		// hands Trivy above.
+		ScanResults:  scanRepo,
+		ScanPullUser: cfg.Bootstrap.AdminUsername,
 		// Conan's login handshake hands the client a token it then sends as
 		// Bearer, so it has to be the same JWT OptionalAuth validates.
 		Tokens: authSvc,
