@@ -8,6 +8,17 @@ All releases — Docker images, `docker-compose.yml`, `config.yaml.example` — 
 
 Download `docker-compose.yml` and `config.yaml.example` from the latest release, then follow the relevant section below.
 
+Image tags on `ghcr.io/nexspence/nexspence`:
+
+| Tag | Points to |
+|---|---|
+| `vX.Y.Z`, `vX.Y` | A release |
+| `latest` | The newest release |
+| `main` | The newest build of `main`, not yet released. It moves with every merge that changes code. |
+| Short commit SHA, e.g. `4d1d51e` | One commit on `main`. It never moves, so use it to test a fix before the release. |
+
+`main` is a moving tag: with the chart's default `pullPolicy: IfNotPresent` a node keeps the copy it already has, so set `pullPolicy: Always` when you follow it. The `org.opencontainers.image.version` label and `/api/v1/system/info` show which build runs, e.g. `v2.12.1-3-g4d1d51e`.
+
 ---
 
 ## Docker Compose — Standard
