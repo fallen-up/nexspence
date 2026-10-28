@@ -86,7 +86,7 @@ Nexspence follows a clean layered architecture. Each layer depends only on the l
 - **Auth middleware** (`internal/api/handlers/auth.go`):
   - JWT Bearer (`Authorization: Bearer <jwt>`)
   - User API tokens — `Authorization: Bearer nxs_…` or Basic password field
-  - HTTP Basic with username + password (bcrypt check)
+  - HTTP Basic with username + password (bcrypt check, or LDAP bind). A verified password is cached per process for `auth.basic_auth_cache_ttl` (`UserService.VerifyPassword`); `/api/v1/login` and `/v2/token` always verify
   - `OptionalAuth` variant for artifact endpoints — anonymous reads allowed per repo config
 - **Audit middleware** — goroutine write after POST/PUT/DELETE/PATCH on key paths; login events use `action=LOGIN`, `entityName=username` (set by Login handler via `c.Set("username", ...)` before returning)
 - **Metrics middleware** — atomic counter increments (requests, errors); cumulative counters (`ArtifactsStored`, `BytesStored`, `DownloadsTotal`) seeded from DB on startup

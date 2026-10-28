@@ -367,6 +367,17 @@ HA nodes, so spreading attempts over servers does not multiply it.
 Failed credentials are logged wherever they occur, including on the paths that
 fall through to anonymous access; previously those left no trace at all.
 
+**Verified-password cache.** Package managers send the password with every
+request, so Basic auth remembers a password that verified, per process, for
+`auth.basic_auth_cache_ttl` (default `1m`, `0` turns it off). The login
+endpoints `/api/v1/login` and `/v2/token` always verify. The entry is an HMAC
+under a random per-process key and only a successful check creates one, so
+guessing never fills it and never skips the backoff above. The account itself
+is read on every request: disabling it in Nexspence takes effect at once, and a
+local password change makes the old entry unreachable. For LDAP users the cache
+also skips the directory bind, so a password change, a lockout or a group
+change in the directory reaches Nexspence after at most the TTL.
+
 **Request rate limit.** `auth.rate_limit_enabled` (on by default) additionally
 buckets requests per authenticated user, or per client address for anonymous
 calls. It is coarser and complements, rather than replaces, the per-account

@@ -416,6 +416,43 @@ func TestLoad_HelmIndexCacheTTL(t *testing.T) {
 	})
 }
 
+// Package managers send a Basic-auth password with every request, so the cache
+// of verified passwords ships on. An operator whose LDAP lockouts must apply at
+// once sets 0.
+func TestLoad_BasicAuthCacheTTL(t *testing.T) {
+	const base = "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+
+	t.Run("default", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(base), 0o600))
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, time.Minute, cfg.Auth.BasicAuthCacheTTL)
+	})
+
+	t.Run("from the config file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(base+"  basic_auth_cache_ttl: 15s\n"), 0o600))
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, 15*time.Second, cfg.Auth.BasicAuthCacheTTL)
+	})
+
+	t.Run("from the environment", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(base), 0o600))
+		t.Setenv("NEXSPENCE_AUTH_BASIC_AUTH_CACHE_TTL", "0s")
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Zero(t, cfg.Auth.BasicAuthCacheTTL, "0 must reach the server as caching off")
+	})
+}
+
 // The bootstrap admin exists so a fresh install has someone to log in as, so
 // it is on by default. Operators who have already created their own accounts
 // turn it off — see TestLoad_BootstrapCanBeDisabled.

@@ -233,6 +233,28 @@ func TestOptionalAuth_ValidBearer_SetsUser(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "dave")
 }
 
+// Package managers send the same Basic credentials on every request. The
+// repeated request, which the service answers from its cache, must still
+// identify the user, and a wrong password must still stay anonymous.
+func TestOptionalAuth_BasicAuth_RepeatedRequestsSetUser(t *testing.T) {
+	svc := newUserSvc(activeUser("dave", "pw"))
+	r := buildOptionalAuthRouter(svc)
+
+	get := func(password string) string {
+		req := httptest.NewRequest(http.MethodGet, "/open", nil)
+		req.SetBasicAuth("dave", password)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code)
+		return w.Body.String()
+	}
+
+	for range 2 {
+		assert.JSONEq(t, `{"user":"dave"}`, get("pw"))
+	}
+	assert.JSONEq(t, `{"user":null}`, get("wrong"))
+}
+
 // ── AuthHandler.Login ─────────────────────────────────────────
 
 func TestLogin_ValidCredentials(t *testing.T) {

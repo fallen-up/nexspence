@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/nexspence-oss/nexspence/internal/auth"
 	"github.com/nexspence-oss/nexspence/internal/config"
@@ -27,6 +28,11 @@ type UserService struct {
 	saml    auth.SAMLAuthenticator // nil when SAML is disabled
 	samlCfg config.SAMLConfig      // empty when SAML is disabled
 	log     logger.Logger
+
+	basic *basicAuthCache
+	// checkPassword is auth.CheckPassword. Tests replace it to count the
+	// bcrypt compares.
+	checkPassword func(hash, plain string) error
 }
 
 // NewUserService constructs a service for managing users, their passwords, and roles.
@@ -36,7 +42,11 @@ func NewUserService(
 	auth *auth.Service,
 	log logger.Logger,
 ) *UserService {
-	return &UserService{users: users, roles: roles, auth: auth, log: log}
+	return &UserService{
+		users: users, roles: roles, auth: auth, log: log,
+		basic:         newBasicAuthCache(defaultBasicAuthTTL),
+		checkPassword: auth.CheckPassword,
+	}
 }
 
 // WithLDAP attaches an LDAP authenticator and its config.
@@ -60,6 +70,13 @@ func (s *UserService) WithOIDC(a auth.OIDCAuthenticator, cfg config.OIDCConfig) 
 // is the source of truth for groups on every OIDC login.
 func (s *UserService) WithGroupLookup(l auth.GroupLookup) *UserService {
 	s.groups = l
+	return s
+}
+
+// WithBasicAuthCacheTTL sets how long a Basic-auth password verified by
+// VerifyPassword skips bcrypt or the LDAP bind. 0 turns the cache off.
+func (s *UserService) WithBasicAuthCacheTTL(ttl time.Duration) *UserService {
+	s.basic.ttl = ttl
 	return s
 }
 
@@ -116,6 +133,83 @@ func (s *UserService) Login(ctx context.Context, username, password string) (str
 	}
 	_ = s.users.UpdateLastLogin(ctx, username)
 	return token, u, nil
+}
+
+// VerifyPassword authenticates Basic-auth credentials for the auth
+// middlewares. Package managers send them once per file, and scripts send
+// them once per API call. Unlike Login it mints no JWT, it writes last_login
+// at most once per lastLoginInterval, and it skips bcrypt or the LDAP bind for
+// a password that verified within the cache TTL. The user is read on every
+// call, so a disabled or deleted account is refused at once.
+func (s *UserService) VerifyPassword(ctx context.Context, username, password string) (*domain.User, error) {
+	u, err := s.users.Get(ctx, username)
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return nil, err
+	}
+
+	// The same routing as Login.
+	if s.ldap != nil && (u == nil || u.Source == domain.UserSourceLDAP) {
+		return s.verifyLDAP(ctx, username, password, u)
+	}
+
+	if u == nil {
+		return nil, fmt.Errorf("%w: user %q", ErrNotFound, username)
+	}
+	if u.Status != domain.UserStatusActive {
+		return nil, fmt.Errorf("%w: user account is not active", ErrInvalidInput)
+	}
+
+	k := s.basic.key(username, password, u.PasswordHash)
+	if !s.basic.hit(k) {
+		if _, err := s.basic.verify(k, func() (any, error) {
+			return nil, s.checkPassword(u.PasswordHash, password)
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	if s.basic.lastLoginDue(u.Username) {
+		_ = s.users.UpdateLastLogin(ctx, u.Username)
+	}
+	return u, nil
+}
+
+// verifyLDAP is VerifyPassword for LDAP users. A cache miss runs the full
+// Login, which binds, creates the local record and syncs the profile and the
+// roles. A cache hit trusts the local record that this login synced. A
+// password change, a lockout or a group change in the directory therefore
+// takes effect after at most the cache TTL. A lockout in nexspence takes
+// effect at once.
+func (s *UserService) verifyLDAP(ctx context.Context, username, password string, u *domain.User) (*domain.User, error) {
+	// Login keys LDAP users by the lowercased name. Look up the same record,
+	// so that "svcDevOps" and "svcdevops" share one cache entry.
+	normalized := strings.ToLower(username)
+	if u == nil && normalized != username {
+		var err error
+		u, err = s.users.Get(ctx, normalized)
+		if err != nil && !errors.Is(err, repository.ErrNotFound) {
+			return nil, err
+		}
+	}
+
+	k := s.basic.key(normalized, password, string(domain.UserSourceLDAP))
+	if u != nil && u.Source == domain.UserSourceLDAP && u.Status == domain.UserStatusActive && s.basic.hit(k) {
+		if s.basic.lastLoginDue(u.Username) {
+			_ = s.users.UpdateLastLogin(ctx, u.Username)
+		}
+		return u, nil
+	}
+
+	// Concurrent callers share this login. One caller's canceled request
+	// must not fail the others.
+	v, err := s.basic.verify(k, func() (any, error) {
+		_, lu, err := s.Login(context.WithoutCancel(ctx), username, password)
+		return lu, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*domain.User), nil
 }
 
 // loginLDAP authenticates via LDAP and upserts the local user record.

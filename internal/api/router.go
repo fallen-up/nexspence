@@ -135,7 +135,8 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 	blobRegistry := storage.NewRegistry(localBlob)
 
 	repoSvc := service.NewRepositoryService(repoRepo, blobRepo, localBlob, cleanupRepo)
-	userSvc := service.NewUserService(userRepo, roleRepo, authSvc, log)
+	userSvc := service.NewUserService(userRepo, roleRepo, authSvc, log).
+		WithBasicAuthCacheTTL(cfg.Auth.BasicAuthCacheTTL)
 	var ldapSvc auth.LDAPAuthenticator
 	if svc := auth.NewLDAPService(cfg.LDAP); svc != nil {
 		ldapSvc = svc

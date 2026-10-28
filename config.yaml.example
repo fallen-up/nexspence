@@ -88,6 +88,13 @@ auth:
   anonymous_enabled: true
   password_min_length: 8
   bcrypt_cost: 12
+  # Package managers send the password with every request, and each bcrypt
+  # compare costs about 250 ms of CPU. A Basic-auth password that verified
+  # skips bcrypt (or, for LDAP users, the LDAP bind) for this long. The login
+  # endpoints /api/v1/login and /v2/token always verify. "0" turns the cache
+  # off. For LDAP users, a password change or a lockout in the directory
+  # takes effect after at most this long.
+  basic_auth_cache_ttl: "1m"
   token_max_days: 180
   # Token-bucket throttle per authenticated user, or per client address for
   # anonymous calls. On by default: without it /api/v1/login is an unmetered

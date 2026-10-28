@@ -225,6 +225,12 @@ type AuthConfig struct {
 	RateLimitEnabled  bool    `mapstructure:"rate_limit_enabled"`
 	RateLimitRPS      float64 `mapstructure:"rate_limit_rps"`
 	RateLimitBurst    float64 `mapstructure:"rate_limit_burst"`
+	// BasicAuthCacheTTL is how long a Basic-auth password that verified skips
+	// bcrypt (local users) or the LDAP bind (LDAP users). /api/v1/login and
+	// /v2/token always verify. 0 turns the cache off. For LDAP users, a
+	// password change or a lockout in the directory takes effect after at
+	// most this long.
+	BasicAuthCacheTTL time.Duration `mapstructure:"basic_auth_cache_ttl"`
 	// AllowInsecureDefaults permits the server to start even when the shipped
 	// default JWT secret or admin password ("admin123") is in use. Intended for
 	// local dev / quick-start only; production must leave this false.
@@ -656,6 +662,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("auth.anonymous_enabled", true)
 	v.SetDefault("auth.password_min_length", 8)
 	v.SetDefault("auth.bcrypt_cost", 12)
+	v.SetDefault("auth.basic_auth_cache_ttl", "1m")
 	v.SetDefault("auth.token_max_days", 90)
 	v.SetDefault("auth.rate_limit_enabled", true)
 	v.SetDefault("auth.rate_limit_rps", 50.0)

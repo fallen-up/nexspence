@@ -354,7 +354,7 @@ func AuthMiddleware(users *service.UserService, tokens *service.TokenService, gu
 					c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "too many failed attempts"})
 					return
 				}
-				_, user, err := users.Login(ctx, username, password)
+				user, err := users.VerifyPassword(ctx, username, password)
 				if err != nil {
 					guard.RecordFailure(ctx, username)
 					logAuthEvent(log, "authentication failed", c, username, "err", err)
@@ -492,7 +492,7 @@ func DockerV2Auth(
 					c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "too many failed attempts"})
 					return
 				}
-				_, user, err := users.Login(ctx, username, password)
+				user, err := users.VerifyPassword(ctx, username, password)
 				if err == nil {
 					guard.RecordSuccess(ctx, username)
 					c.Set("username", user.Username)
@@ -565,7 +565,7 @@ func OptionalAuth(users *service.UserService, tokens *service.TokenService, guar
 				c.Next()
 				return
 			}
-			if _, user, err := users.Login(ctx, username, password); err == nil {
+			if user, err := users.VerifyPassword(ctx, username, password); err == nil {
 				guard.RecordSuccess(ctx, username)
 				c.Set("username", user.Username)
 				c.Set("userID", user.ID)
